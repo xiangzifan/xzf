@@ -327,8 +327,8 @@ def build_graph_refiner(opt, device):
     ).to(device)
 
 
-def build_memory_queue(opt):
-    """Construct the selected Memory ablation."""
+def build_memory_queue(opt, device=None):
+    """Construct the selected Memory ablation on an explicit runtime device."""
     return MemoryQueue(
         queue_size=opt.queue_size,
         dim=opt.embed_size,
@@ -341,6 +341,7 @@ def build_memory_queue(opt):
         alpha_min=opt.memory_alpha_min,
         alpha_max=opt.memory_alpha_max,
         quality_momentum=opt.memory_quality_momentum,
+        device=device,
     )
 
 
@@ -369,7 +370,7 @@ def ensure_rectification_modules(opt, net):
     """Create Memory and both refiners exactly once and register optimizer groups."""
     device = _model_device(net)
     if not hasattr(net, "memory_queue"):
-        net.memory_queue = build_memory_queue(opt)
+        net.memory_queue = build_memory_queue(opt, device=device)
     if net.memory_queue.device != device:
         raise RuntimeError("memory queue and encoder must share a device")
 

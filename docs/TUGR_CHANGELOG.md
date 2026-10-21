@@ -7,6 +7,18 @@ Parent: `IN2R_A5Delete_RESB_v1_20261020`
 This file records implementation facts. It does not claim a retrieval gain;
 that claim requires the planned AutoDL reproduction.
 
+## CUDA preflight device-inheritance hotfix
+
+- `build_memory_queue` now receives the encoder's resolved runtime device and
+  passes it explicitly to `MemoryQueue`.
+- Retained the strict post-construction device check; the fix removes the
+  implicit device choice instead of weakening the invariant.
+- Strengthened the runtime-state round-trip test by simulating a CUDA-capable
+  host with a deliberately CPU-resident encoder. This regression would fail
+  under the former CUDA-availability fallback even on a CPU-only test host.
+- This fixes the AutoDL-only preflight failure without changing retrieval,
+  optimization, checkpoint, or TUGR equations.
+
 ## `co_train.py`
 
 ### GraphRefiner

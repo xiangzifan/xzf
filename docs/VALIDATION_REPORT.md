@@ -16,7 +16,9 @@ Target: A5-Delete + RESB M2 + TUGR-Full
    - shape, finiteness, and unit-norm checks for all four factorial modes;
    - finite TUGR backward gradients and frozen unused legacy edges;
    - query-alignment input validation;
-   - compact Memory plus directional GraphRefiner state round-trip.
+   - compact Memory plus directional GraphRefiner state round-trip;
+   - explicit Memory inheritance of the encoder device while CUDA availability
+     is simulated independently of the CPU-resident test fixture;
    - atomic checkpoint completion and temporary-file cleanup.
 3. The test command completed with no failures:
 
@@ -33,6 +35,9 @@ Target: A5-Delete + RESB M2 + TUGR-Full
 6. Compact Memory serialization restores the ID-to-slot mapping and selected
    output; the complete rectification state restores both directional
    GraphRefiner tensors exactly.
+7. The CUDA-host regression no longer depends on the test machine's actual GPU:
+   it mocks CUDA availability while keeping `DummyNet` on CPU, and verifies that
+   Memory follows the encoder device rather than the global CUDA fallback.
 
 ## Engineering protections added
 

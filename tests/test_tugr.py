@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 import sys
 import types
 import os
@@ -185,7 +186,15 @@ class GraphRefinerTests(unittest.TestCase):
             memory_quality_momentum=0.5,
         )
         source = DummyNet(dim=4)
-        ensure_rectification_modules(options, source)
+        # Simulate a CUDA-capable host while keeping this fixture deliberately
+        # on CPU.  Runtime construction must follow the encoder device instead
+        # of MemoryQueue's CUDA-availability fallback.
+        with mock.patch("memory_bank.torch.cuda.is_available", return_value=True):
+            ensure_rectification_modules(options, source)
+        self.assertEqual(
+            source.memory_queue.device,
+            next(source.img_enc.parameters()).device,
+        )
         features = F.normalize(torch.eye(4), dim=-1)
         source.memory_queue.enqueue(
             features,
@@ -197,7 +206,12 @@ class GraphRefinerTests(unittest.TestCase):
         state = rectification_state_dict(source)
 
         restored = DummyNet(dim=4)
-        ensure_rectification_modules(options, restored)
+        with mock.patch("memory_bank.torch.cuda.is_available", return_value=True):
+            ensure_rectification_modules(options, restored)
+        self.assertEqual(
+            restored.memory_queue.device,
+            next(restored.img_enc.parameters()).device,
+        )
         load_rectification_state_dict(restored, state)
 
         self.assertEqual(
