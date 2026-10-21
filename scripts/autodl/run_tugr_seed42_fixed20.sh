@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # Environment variables can override every machine-specific path.
-CODE_DIR="${IN2R_CODE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+CODE_DIR="${IN2R_CODE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 PYTHON_BIN="${IN2R_PYTHON:-/root/miniconda3/envs/in2r/bin/python}"
 ENV_ROOT="${IN2R_ENV_ROOT:-/root/miniconda3/envs/in2r}"
 DATA_DIR="${IN2R_DATA_PATH:-/root/autodl-tmp/Flickr_xzf}"
