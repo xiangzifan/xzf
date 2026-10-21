@@ -1,4 +1,4 @@
-# IN2R A5-Delete + RESB + TUGR
+# IN2R A5-Delete + RESB + QASR
 
 Private research repository for reproducible experiments derived from the
 official [IN2R project](https://github.com/liuyyy111/IN2R). The current `main`
@@ -13,10 +13,29 @@ The default experiment combines:
 1. **A5-Delete**: the confirmed IN2R baseline variant;
 2. **RESB M2 (`quality_diverse`)**: ID refresh plus reliability, freshness,
    and MMR-aware support selection;
-3. **TUGR-Full**: Query-conditioned Discriminative Message Passing (QDMP)
-   followed by Discriminative Utility-Aligned pooling (DUA-Pool).
+3. **QASR-Full**: Query-Anchored Selective Refinement with metadata-preserving
+   graph propagation, sparse support selection, and a safe residual fallback.
 
-No synthetic clean/noisy ground-truth label is read by RESB or TUGR.
+No synthetic clean/noisy ground-truth label is read by RESB, TUGR, or QASR.
+
+## QASR mechanism
+
+For query `q_i` and the `K` paired target-modality supports selected by RESB,
+QASR combines three bounded evidence channels:
+
+```text
+query relevance:       a[i,j] = (1 + cos(q_i, v[i,j])) / 2
+support consensus:     c[i,j] = (1 + mean_{k != j} cos(v[i,j], v[i,k])) / 2
+Memory reliability:    r[i,j] = quality[i,j] * freshness[i,j]
+evidence:              s[i,j] = (wq*a + wc*c + wm*r) / (wq + wc + wm)
+```
+
+The raw evidence is not standardized. Its query-relevance outer product biases
+support-graph edges, while `Sparsemax(s / tau)` can give irrelevant supports
+exactly zero mass. The selected prototype is blended with the legacy mean
+prototype using reliability times normalized selection confidence. Uniform
+evidence therefore falls back exactly to the legacy mean path instead of
+forcing an uncertain correction.
 
 ## TUGR mechanism
 
@@ -48,8 +67,10 @@ recommended run is the full model:
 | `dua_pool` | original support self-attention | DUA |
 | `qdmp_mean` | QDMP | equal mean |
 | `tugr_full` | QDMP | DUA |
+| `qasr_full` | query-anchored graph | evidence-gated Sparsemax + mean residual |
 
-`tugr_full` is the default.
+`qasr_full` is the default. The older TUGR modes remain frozen for controlled
+comparison; they are not silently changed by the QASR implementation.
 
 ## Controlled Memory modes
 
@@ -79,16 +100,19 @@ python run.py \
   --num_epochs 40 \
   --co_train_epochs 20 \
   --memory_mode quality_diverse \
-  --refiner_mode tugr_full \
+  --refiner_mode qasr_full \
   --k 5 \
   --refiner_heads 4 \
-  --refiner_utility_temperature 0.1 \
-  --refiner_pool_temperature 0.1 \
-  --refiner_message_prior_strength 0.5 \
+  --refiner_qasr_pool_temperature 0.25 \
+  --refiner_qasr_query_weight 1.0 \
+  --refiner_qasr_consensus_weight 0.5 \
+  --refiner_qasr_metadata_weight 0.25 \
+  --refiner_qasr_graph_strength 0.5 \
+  --refiner_qasr_residual_strength 1.0 \
   --output_dir "$IN2R_OUTPUT_DIR"
 ```
 
-Do not add `--refiner_end_to_end_utility` for the first reproduction.
+Do not add `--refiner_qasr_end_to_end_evidence` for the first reproduction.
 
 ## Strict resume
 
@@ -117,9 +141,11 @@ and GraphRefiner statistics:
 
 - utility mean and standard deviation;
 - pooling top-1 weight and entropy;
-- soft effective K;
+- inverse-concentration effective K and exact active K;
 - maximum pooling normalization error;
 - message entropy;
+- QASR query relevance, support consensus, metadata reliability, evidence
+  score, and correction-gate statistics;
 - RESB quality, freshness, overlap, and value-diversity diagnostics.
 
 ## Validation
@@ -130,27 +156,28 @@ CPU-compatible deterministic tests:
 python -m unittest -v tests/test_memory_bank.py tests/test_tugr.py
 ```
 
-The tests cover the original mean-path numerical equivalence, the closed-form
-DUA value in a two-query example, all four factorial modes, finite backward
-gradients, query propagation through Memory, compact state round-trips, and
-strict runtime rectification restoration.
+The tests cover the original mean-path numerical equivalence, TUGR regression,
+the Sparsemax simplex projection, QASR evidence and safe fallback, finite
+backward gradients, metadata alignment between Memory and GraphRefiner,
+compact state round-trips, and strict runtime rectification restoration.
 
 The local Windows machine has a PyTorch/torchtext binary mismatch, so full VSE
 GPU training must be run in the established AutoDL environment. See
 `docs/VALIDATION_REPORT.md` for the exact local checks and remaining server
-smoke test. The ready-to-run fixed-20 launcher is
-`scripts/autodl/run_tugr_seed42_fixed20.sh`.
+smoke test. The two fixed-20 launchers are
+`scripts/autodl/run_resb_mean_seed42_fixed20.sh` and
+`scripts/autodl/run_qasr_seed42_fixed20.sh`.
 
 ## Repository layout
 
 - `run.py`: co-training entry point and experiment configuration;
-- `co_train.py`: A5-Delete co-training plus TUGR GraphRefiner;
+- `co_train.py`: A5-Delete co-training plus controlled TUGR/QASR refiners;
 - `memory_bank.py`: RESB Memory implementation;
 - `data.py`: dataset loading and stable record identifiers;
 - `model.py`, `vse.py`, `vse_.py`: retrieval models and losses;
 - `evaluation.py`: validation and test metrics;
 - `tests/`: CPU regression tests;
-- `docs/`: RESB/TUGR change and validation records;
+- `docs/`: RESB/TUGR/QASR change and validation records;
 - `scripts/autodl/`: controlled AutoDL launchers.
 
 Datasets, GloVe/NLTK assets, noise-map binaries, checkpoints, logs, output
@@ -187,10 +214,10 @@ final test metrics.
 
 ## Current validation boundary
 
-The Memory/TUGR unit tests and source compilation pass locally. Full VSE CUDA
-training has not been executed on the local Windows host because its installed
-torchtext binary is incompatible with PyTorch. No rSum improvement is claimed
-until the fixed AutoDL reproduction completes.
+The Memory/TUGR/QASR unit tests and source compilation pass locally. Full QASR
+VSE CUDA training has not been executed on the local Windows host because its
+installed torchtext binary is incompatible with PyTorch. No QASR rSum
+improvement is claimed until the fixed AutoDL reproduction completes.
 
 ## Attribution
 

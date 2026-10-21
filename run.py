@@ -139,7 +139,7 @@ def run():
     parser.add_argument(
         "--resume",
         default="",
-        help="Strictly resume a TUGR co-training checkpoint at an epoch boundary.",
+        help="Strictly resume a rectification checkpoint at an epoch boundary.",
     )
     parser.add_argument(
         "--p_threshold", default=0.5, type=float, help="clean probability threshold"
@@ -165,11 +165,11 @@ def run():
     )
     parser.add_argument(
         "--refiner_mode",
-        default="tugr_full",
-        choices=["mean", "dua_pool", "qdmp_mean", "tugr_full"],
+        default="qasr_full",
+        choices=["mean", "dua_pool", "qdmp_mean", "tugr_full", "qasr_full"],
         help=(
-            "GraphRefiner 2x2 mode: original messages/mean, original messages/DUA, "
-            "QDMP/mean, or the full QDMP+DUA model."
+            "GraphRefiner mode: legacy mean, TUGR factorial variants, or the "
+            "full Query-Anchored Selective Refiner."
         ),
     )
     parser.add_argument(
@@ -208,6 +208,50 @@ def run():
         help=(
             "Allow gradients through DUA routing scores. Off by default for the "
             "stable detached TUGR configuration."
+        ),
+    )
+    parser.add_argument(
+        "--refiner_qasr_pool_temperature",
+        default=0.25,
+        type=float,
+        help="Sparsemax temperature for QASR support selection.",
+    )
+    parser.add_argument(
+        "--refiner_qasr_query_weight",
+        default=1.0,
+        type=float,
+        help="Nonnegative weight of current-query relevance in QASR evidence.",
+    )
+    parser.add_argument(
+        "--refiner_qasr_consensus_weight",
+        default=0.5,
+        type=float,
+        help="Nonnegative weight of within-support consensus in QASR evidence.",
+    )
+    parser.add_argument(
+        "--refiner_qasr_metadata_weight",
+        default=0.25,
+        type=float,
+        help="Nonnegative weight of RESB quality-freshness evidence in QASR.",
+    )
+    parser.add_argument(
+        "--refiner_qasr_graph_strength",
+        default=0.5,
+        type=float,
+        help="Nonnegative query-anchor bias strength in QASR graph propagation.",
+    )
+    parser.add_argument(
+        "--refiner_qasr_residual_strength",
+        default=1.0,
+        type=float,
+        help="Bounded [0,1] maximum QASR deviation from the mean prototype.",
+    )
+    parser.add_argument(
+        "--refiner_qasr_end_to_end_evidence",
+        action="store_true",
+        help=(
+            "Allow gradients through QASR routing evidence. Off by default to "
+            "prevent routing-score shortcuts in the first controlled run."
         ),
     )
     parser.add_argument(
@@ -323,6 +367,33 @@ def run():
         parser.error("--refiner_message_prior_strength must be nonnegative")
     if not np.isfinite(opt.refiner_eps) or opt.refiner_eps <= 0:
         parser.error("--refiner_eps must be finite and positive")
+    if (
+        not np.isfinite(opt.refiner_qasr_pool_temperature)
+        or opt.refiner_qasr_pool_temperature <= 0
+    ):
+        parser.error("--refiner_qasr_pool_temperature must be finite and positive")
+    qasr_weights = (
+        opt.refiner_qasr_query_weight,
+        opt.refiner_qasr_consensus_weight,
+        opt.refiner_qasr_metadata_weight,
+    )
+    if (
+        any(not np.isfinite(weight) or weight < 0 for weight in qasr_weights)
+        or sum(qasr_weights) <= 0
+    ):
+        parser.error("QASR evidence weights must be finite, nonnegative and nonzero")
+    if (
+        not np.isfinite(opt.refiner_qasr_graph_strength)
+        or opt.refiner_qasr_graph_strength < 0
+    ):
+        parser.error("--refiner_qasr_graph_strength must be finite and nonnegative")
+    if (
+        not np.isfinite(opt.refiner_qasr_residual_strength)
+        or not 0 <= opt.refiner_qasr_residual_strength <= 1
+    ):
+        parser.error("--refiner_qasr_residual_strength must be in [0, 1]")
+    if opt.refiner_mode == "qasr_full" and opt.memory_mode != "quality_diverse":
+        parser.error("--refiner_mode=qasr_full requires --memory_mode=quality_diverse")
     if opt.memory_candidate_pool_size < opt.k:
         parser.error("--memory_candidate_pool_size must be >= --k")
     if (

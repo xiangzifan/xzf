@@ -1,76 +1,83 @@
 # Local validation report
 
-Date: 2026-10-21
+Date: 2026-10-22
 
-Target: A5-Delete + RESB M2 + TUGR-Full
+Target: A5-Delete + RESB M2 + controlled Mean/TUGR/QASR GraphRefiners
 
 ## Passed locally
 
-1. Every Python source compiled successfully with `python -m compileall -q .`.
-2. Sixteen deterministic CPU tests passed:
-   - eight inherited RESB/data tests;
-   - exact propagation of query embeddings from Memory to GraphRefiner;
+1. The modified Python sources compile successfully with `py_compile`.
+2. Twenty-two deterministic CPU tests pass:
+   - nine RESB/data/metadata-interface tests;
    - legacy mean-path numerical equivalence;
-   - analytical two-query DUA value;
-   - finite batch-size-one utility fallback;
-   - shape, finiteness, and unit-norm checks for all four factorial modes;
-   - finite TUGR backward gradients and frozen unused legacy edges;
-   - query-alignment input validation;
-   - compact Memory plus directional GraphRefiner state round-trip;
-   - explicit Memory inheritance of the encoder device while CUDA availability
-     is simulated independently of the CPU-resident test fixture;
+   - analytical TUGR two-query utility and batch-size-one fallback;
+   - output shape, finiteness, normalization, and pooling normalization for all
+     five modes;
+   - Sparsemax probability-simplex projection and exact sparsity;
+   - bounded QASR query/consensus/metadata evidence;
+   - strict rejection of missing or misaligned QASR metadata;
+   - QASR's exact fallback to the legacy mean path under uniform evidence;
+   - finite TUGR and QASR backward gradients;
+   - exact alignment between RESB-selected slots and quality/freshness passed
+     to QASR;
+   - compact Memory and directional GraphRefiner state round-trip;
+   - Memory inheritance of the encoder device when CUDA availability is mocked;
    - atomic checkpoint completion and temporary-file cleanup.
-3. The test command completed with no failures:
+3. The command completed with no failures:
 
    ```text
-   python -m unittest -v test_memory_bank.py test_tugr.py
-   Ran 16 tests ... OK
+   python -m unittest -v tests/test_memory_bank.py tests/test_tugr.py
+   Ran 22 tests ... OK
    ```
 
-4. The new `mean` mode was evaluated against an explicit implementation of
-   the parent A5-Delete forward equations after copying the same weights; the
-   outputs matched within `atol=1e-7, rtol=1e-6`.
-5. DUA was checked against a closed-form two-query example with expected
-   utilities `[[1, -1], [1, -1]]`.
-6. Compact Memory serialization restores the ID-to-slot mapping and selected
-   output; the complete rectification state restores both directional
-   GraphRefiner tensors exactly.
-7. The CUDA-host regression no longer depends on the test machine's actual GPU:
-   it mocks CUDA availability while keeping `DummyNet` on CPU, and verifies that
-   Memory follows the encoder device rather than the global CUDA fallback.
+4. `git diff --check` reports no whitespace errors.
+5. A deterministic synthetic diagnostic smoke check over three seeds produced
+   finite QASR outputs, pooling sums within `1.2e-7` of one, active support
+   counts around four of five, inverse-concentration effective K around three,
+   and finite residual gates. This is a numerical check, not retrieval evidence.
 
-## Engineering protections added
+## Regression protections
 
-- full-optimizer gradient finiteness checks and clipping;
-- separate i2t and t2i unlabeled-loss accounting;
-- atomic checkpoint replacement;
-- one non-duplicated strict-resume checkpoint;
-- complete Memory/optimizer/RNG epoch-boundary state;
-- critical-configuration compatibility checks on resume;
-- numerical and shape validation at the GraphRefiner boundary.
+- The `mean`, `dua_pool`, `qdmp_mean`, and `tugr_full` branches retain their
+  previous equations.
+- Metadata is passed only when a refiner explicitly declares
+  `requires_support_metadata`; the legacy refiner interface remains valid.
+- QASR is rejected at the command line unless Memory mode is
+  `quality_diverse`.
+- All QASR hyperparameters are finite/range checked and included in strict
+  resume compatibility when either side of a resume is QASR.
+- QASR evidence is detached by default while the message/value path remains
+  differentiable.
+- Sparsemax validates finite inputs and explicitly renormalizes floating-point
+  projection drift.
+- Existing full-optimizer gradient checking/clipping, split i2t/t2i loss
+  accounting, atomic checkpointing, compact Memory state, optimizer state and
+  RNG restoration remain in place.
 
-## Environment-limited check
+## Environment-limited checks
 
-Importing the unmodified `vse.py` on this Windows host fails in `torchtext`
-with `OSError: [WinError 127]`. The installed torchtext binary is incompatible
-with the installed PyTorch runtime. GraphRefiner tests isolate that unrelated
-import; the full CUDA VSE training path cannot be executed on this machine.
-The local WSL launcher also returns `E_ACCESSDENIED`, so the supplied Bash
-launcher must receive its final `bash -n` check in AutoDL.
+Importing the unmodified `vse.py` on this Windows host fails inside `torchtext`
+with `OSError: [WinError 127]`; this is the known local PyTorch/torchtext binary
+mismatch. The unit tests isolate that unrelated import. Full CUDA VSE training
+must run in the established AutoDL environment.
 
-No claim is made that a complete GPU epoch or a retrieval improvement has been
-observed locally.
+The local WSL launcher returns `E_ACCESSDENIED`. Consequently the two Bash
+launchers require a final `bash -n` check on AutoDL. Both tracked launchers run
+Python compilation and all unit tests before starting training.
 
-## Required AutoDL checks before the fixed-20 reproduction
+No QASR retrieval improvement is claimed from local testing.
 
-In the known working IN2R environment:
+## Required AutoDL gate
 
-1. run `python -m unittest -v test_memory_bank.py test_tugr.py`;
-2. compile with `python -m compileall -q .`;
-3. run one short TUGR-Full smoke job that reaches both co-training phases and
-   validation;
-4. verify finite `utility_*`, `pool_*`, `effective_k`, and `message_entropy`;
-5. interrupt after an epoch and resume once from `resume_latest.pth.tar`;
-6. then launch the fixed seed-42 run with `num_epochs=40` as the cosine
-   horizon and `co_train_epochs=20` as the actual execution budget, without
-   changing the default detached-utility setting.
+Before training:
+
+1. verify the supplied commit SHA and a clean Git worktree;
+2. run `bash -n` on both new launchers;
+3. run the 22 unit tests and source compilation;
+4. verify the fixed noise-map SHA-256;
+5. start the same-code RESB-M2 `mean` control and QASR in separate output
+   directories;
+6. require finite QASR `pool_*`, `active_k`, `effective_k`, `message_entropy`,
+   `qasr_*`, and correction-gate diagnostics;
+7. choose checkpoints only by Validation and evaluate Test once after the
+   configuration is frozen.

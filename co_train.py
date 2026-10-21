@@ -33,13 +33,59 @@ from utils import (
 )
 
 
-_VALID_REFINER_MODES = {"mean", "dua_pool", "qdmp_mean", "tugr_full"}
+_VALID_REFINER_MODES = {
+    "mean",
+    "dua_pool",
+    "qdmp_mean",
+    "tugr_full",
+    "qasr_full",
+}
+
+
+def sparsemax(logits, dim=-1):
+    """Sparse probability mapping from Martins & Astudillo (2016).
+
+    Unlike softmax, sparsemax is the Euclidean projection onto the probability
+    simplex and can assign exact zero mass to unsupported items.  The
+    implementation is vectorized, differentiable almost everywhere, and keeps
+    the requested dimension in place.
+    """
+    if logits.ndim == 0:
+        raise ValueError("sparsemax logits must have at least one dimension")
+    if logits.size(dim) < 1:
+        raise ValueError("sparsemax dimension must be non-empty")
+    if not torch.isfinite(logits).all():
+        raise ValueError("sparsemax logits must be finite")
+
+    shifted = logits - logits.max(dim=dim, keepdim=True).values
+    sorted_logits, _ = torch.sort(shifted, dim=dim, descending=True)
+    cumulative = sorted_logits.cumsum(dim)
+    ranks_shape = [1] * logits.ndim
+    ranks_shape[dim] = logits.size(dim)
+    ranks = torch.arange(
+        1,
+        logits.size(dim) + 1,
+        dtype=logits.dtype,
+        device=logits.device,
+    ).view(ranks_shape)
+    support = 1.0 + ranks * sorted_logits > cumulative
+    support_size = support.sum(dim=dim, keepdim=True).clamp_min(1)
+    threshold = (
+        cumulative.gather(dim, support_size - 1) - 1.0
+    ) / support_size.to(logits.dtype)
+    probabilities = (shifted - threshold).clamp_min(0.0)
+    # The projection already sums to one analytically.  Renormalizing removes
+    # the tiny floating-point drift that would otherwise pollute diagnostics.
+    return probabilities / probabilities.sum(dim=dim, keepdim=True).clamp_min(
+        torch.finfo(logits.dtype).eps
+    )
 
 
 class GraphRefiner(nn.Module):
-    """Task-utility-guided support graph refinement.
+    """Controlled support-graph refinement for RESB.
 
-    Modes deliberately form a 2x2 factorial design:
+    The legacy/TUGR modes retain the original 2x2 factorial design, while
+    QASR is exposed as a separate full mechanism:
 
     ``mean``
         Original support self-attention followed by equal mean pooling.
@@ -49,6 +95,10 @@ class GraphRefiner(nn.Module):
         Query-conditioned discriminative message passing followed by mean.
     ``tugr_full``
         QDMP messages and DUA pooling (the proposed full model).
+    ``qasr_full``
+        Query-anchored graph propagation, reliability/consensus evidence,
+        sparse support selection, and an evidence-gated residual to the
+        original mean prototype.
 
     The utility is derived only from train-visible query/support embeddings.  It
     never consumes synthetic clean/noisy ground-truth labels.  By default it is
@@ -68,6 +118,13 @@ class GraphRefiner(nn.Module):
         pool_temperature=0.1,
         message_prior_strength=0.5,
         detach_utility=True,
+        qasr_pool_temperature=0.25,
+        qasr_query_weight=1.0,
+        qasr_consensus_weight=0.5,
+        qasr_metadata_weight=0.25,
+        qasr_graph_strength=0.5,
+        qasr_residual_strength=1.0,
+        detach_qasr_evidence=True,
         eps=1e-6,
     ):
         super(GraphRefiner, self).__init__()
@@ -81,6 +138,19 @@ class GraphRefiner(nn.Module):
             raise ValueError("temperatures and eps must be positive")
         if message_prior_strength < 0:
             raise ValueError("message_prior_strength must be nonnegative")
+        if qasr_pool_temperature <= 0:
+            raise ValueError("qasr_pool_temperature must be positive")
+        qasr_weights = (
+            qasr_query_weight,
+            qasr_consensus_weight,
+            qasr_metadata_weight,
+        )
+        if any(weight < 0 for weight in qasr_weights) or sum(qasr_weights) <= 0:
+            raise ValueError("QASR evidence weights must be nonnegative and nonzero")
+        if qasr_graph_strength < 0:
+            raise ValueError("qasr_graph_strength must be nonnegative")
+        if not 0 <= qasr_residual_strength <= 1:
+            raise ValueError("qasr_residual_strength must be in [0, 1]")
 
         self.dim = int(dim)
         self.k = int(k)
@@ -91,6 +161,13 @@ class GraphRefiner(nn.Module):
         self.pool_temperature = float(pool_temperature)
         self.message_prior_strength = float(message_prior_strength)
         self.detach_utility = bool(detach_utility)
+        self.qasr_pool_temperature = float(qasr_pool_temperature)
+        self.qasr_query_weight = float(qasr_query_weight)
+        self.qasr_consensus_weight = float(qasr_consensus_weight)
+        self.qasr_metadata_weight = float(qasr_metadata_weight)
+        self.qasr_graph_strength = float(qasr_graph_strength)
+        self.qasr_residual_strength = float(qasr_residual_strength)
+        self.detach_qasr_evidence = bool(detach_qasr_evidence)
         self.eps = float(eps)
 
         self.q_proj = nn.Linear(self.dim, self.dim)
@@ -115,7 +192,15 @@ class GraphRefiner(nn.Module):
 
     @property
     def uses_utility(self):
-        return self.mode != "mean"
+        return self.mode in {"dua_pool", "qdmp_mean", "tugr_full"}
+
+    @property
+    def uses_qasr(self):
+        return self.mode == "qasr_full"
+
+    @property
+    def requires_support_metadata(self):
+        return self.uses_qasr
 
     @property
     def uses_qdmp(self):
@@ -145,7 +230,13 @@ class GraphRefiner(nn.Module):
                 result[name] = total / count
         return result
 
-    def _validate_inputs(self, neighbors, query_feats):
+    def _validate_inputs(
+        self,
+        neighbors,
+        query_feats,
+        support_quality=None,
+        support_freshness=None,
+    ):
         if neighbors.ndim != 3:
             raise ValueError("neighbors must have shape [batch, k, dim]")
         batch_size, support_count, dim = neighbors.shape
@@ -159,7 +250,7 @@ class GraphRefiner(nn.Module):
             )
         if not torch.isfinite(neighbors).all():
             raise ValueError("neighbors must be finite")
-        if self.uses_utility:
+        if self.uses_utility or self.uses_qasr:
             if query_feats is None:
                 raise ValueError("query_feats are required by mode {}".format(self.mode))
             if query_feats.shape != (batch_size, self.dim):
@@ -170,6 +261,23 @@ class GraphRefiner(nn.Module):
                 raise ValueError("query_feats and neighbors must share a dtype")
             if not torch.isfinite(query_feats).all():
                 raise ValueError("query_feats must be finite")
+        if self.uses_qasr:
+            for name, metadata in (
+                ("support_quality", support_quality),
+                ("support_freshness", support_freshness),
+            ):
+                if metadata is None:
+                    raise ValueError("{} is required by qasr_full".format(name))
+                if metadata.shape != (batch_size, support_count):
+                    raise ValueError("{} must have shape [batch, k]".format(name))
+                if metadata.device != neighbors.device:
+                    raise ValueError("{} and neighbors must share a device".format(name))
+                if metadata.dtype != neighbors.dtype:
+                    raise ValueError("{} and neighbors must share a dtype".format(name))
+                if not torch.isfinite(metadata).all():
+                    raise ValueError("{} must be finite".format(name))
+                if bool(((metadata < 0) | (metadata > 1)).any().item()):
+                    raise ValueError("{} must be in [0, 1]".format(name))
 
     def compute_discriminative_utility(self, query_feats, neighbors):
         """Return DUA utility with shape [batch, k].
@@ -220,7 +328,72 @@ class GraphRefiner(nn.Module):
         variance = centered.square().mean(dim=-1, keepdim=True)
         return centered / variance.add(self.eps).sqrt()
 
-    def _record_diagnostics(self, utility, pool_weights, message_weights):
+    def compute_qasr_evidence(
+        self,
+        query_feats,
+        neighbors,
+        support_quality,
+        support_freshness,
+    ):
+        """Compute bounded QASR evidence without batch-negative coupling.
+
+        All three evidence channels lie in ``[0, 1]`` before their convex
+        combination: current-query relevance, within-support consensus, and
+        RESB reliability times freshness.  This deliberately avoids TUGR's
+        within-query unit-variance amplification of weak evidence.
+        """
+        normalized_queries = F.normalize(query_feats, p=2, dim=-1, eps=self.eps)
+        normalized_supports = F.normalize(neighbors, p=2, dim=-1, eps=self.eps)
+        query_cosine = (
+            normalized_supports * normalized_queries.unsqueeze(1)
+        ).sum(dim=-1)
+        query_relevance = (0.5 * (query_cosine + 1.0)).clamp(0.0, 1.0)
+
+        if self.k == 1:
+            consensus = torch.ones_like(query_relevance)
+        else:
+            pairwise = torch.matmul(
+                normalized_supports, normalized_supports.transpose(1, 2)
+            )
+            identity = torch.eye(
+                self.k, dtype=torch.bool, device=neighbors.device
+            ).unsqueeze(0)
+            off_diagonal_sum = pairwise.masked_fill(identity, 0.0).sum(dim=-1)
+            consensus_cosine = off_diagonal_sum / float(self.k - 1)
+            consensus = (0.5 * (consensus_cosine + 1.0)).clamp(0.0, 1.0)
+
+        metadata_reliability = support_quality * support_freshness
+        weight_sum = (
+            self.qasr_query_weight
+            + self.qasr_consensus_weight
+            + self.qasr_metadata_weight
+        )
+        evidence = (
+            self.qasr_query_weight * query_relevance
+            + self.qasr_consensus_weight * consensus
+            + self.qasr_metadata_weight * metadata_reliability
+        ) / weight_sum
+
+        if self.detach_qasr_evidence:
+            query_relevance = query_relevance.detach()
+            consensus = consensus.detach()
+            metadata_reliability = metadata_reliability.detach()
+            evidence = evidence.detach()
+        return {
+            "score": evidence,
+            "query_relevance": query_relevance,
+            "consensus": consensus,
+            "metadata_reliability": metadata_reliability,
+        }
+
+    def _record_diagnostics(
+        self,
+        utility,
+        pool_weights,
+        message_weights,
+        qasr_evidence=None,
+        correction_gate=None,
+    ):
         batch_size = pool_weights.size(0)
         tiny = torch.finfo(pool_weights.dtype).tiny
         pool_entropy = -(
@@ -238,6 +411,11 @@ class GraphRefiner(nn.Module):
         )
         self._record_scalar("pool_entropy", pool_entropy.mean(), batch_size)
         self._record_scalar("effective_k", effective_k.mean(), batch_size)
+        self._record_scalar(
+            "active_k",
+            (pool_weights > self.eps).sum(dim=-1).to(pool_weights.dtype).mean(),
+            batch_size,
+        )
         self._record_scalar("pool_sum_error", pool_sum_error.max())
         if utility is not None:
             self._record_scalar("utility_mean", utility.mean(), batch_size)
@@ -254,14 +432,54 @@ class GraphRefiner(nn.Module):
                 "message_entropy", message_entropy.mean(), batch_size
             )
 
-    def forward(self, neighbors, query_feats=None):
+        if qasr_evidence is not None:
+            for name in (
+                "score",
+                "query_relevance",
+                "consensus",
+                "metadata_reliability",
+            ):
+                values = qasr_evidence[name]
+                self._record_scalar(
+                    "qasr_{}_mean".format(name), values.mean(), batch_size
+                )
+                self._record_scalar(
+                    "qasr_{}_std".format(name),
+                    values.std(unbiased=False),
+                    batch_size,
+                )
+        if correction_gate is not None:
+            self._record_scalar(
+                "qasr_correction_gate", correction_gate.mean(), batch_size
+            )
+
+    def forward(
+        self,
+        neighbors,
+        query_feats=None,
+        support_quality=None,
+        support_freshness=None,
+    ):
         """Refine a retrieved support set into one normalized prototype."""
-        self._validate_inputs(neighbors, query_feats)
+        self._validate_inputs(
+            neighbors,
+            query_feats,
+            support_quality=support_quality,
+            support_freshness=support_freshness,
+        )
         batch_size, support_count, dim = neighbors.size()
 
         utility = None
+        qasr_evidence = None
         if self.uses_utility:
             utility = self.compute_discriminative_utility(query_feats, neighbors)
+        elif self.uses_qasr:
+            qasr_evidence = self.compute_qasr_evidence(
+                query_feats,
+                neighbors,
+                support_quality,
+                support_freshness,
+            )
 
         projected_queries = self.q_proj(neighbors).view(
             batch_size, support_count, self.n_heads, self.d_k
@@ -282,6 +500,13 @@ class GraphRefiner(nn.Module):
                 self.message_prior_strength
                 * standardized_utility[:, None, None, :]
             )
+        elif self.uses_qasr:
+            anchor = qasr_evidence["query_relevance"]
+            query_conditioned_edges = anchor.unsqueeze(-1) * anchor.unsqueeze(-2)
+            attention_logits = attention_logits + (
+                self.qasr_graph_strength
+                * query_conditioned_edges[:, None, :, :]
+            )
 
         message_weights = F.softmax(attention_logits, dim=-1)
         context = torch.matmul(message_weights, projected_values)
@@ -292,6 +517,7 @@ class GraphRefiner(nn.Module):
             neighbors + self.dropout(self.output_layer(context))
         )
 
+        correction_gate = None
         if self.uses_dua_pool:
             pool_weights = F.softmax(
                 utility / self.pool_temperature, dim=-1
@@ -299,6 +525,38 @@ class GraphRefiner(nn.Module):
             refined_feat = (
                 pool_weights.unsqueeze(-1) * refined_nodes
             ).sum(dim=1)
+        elif self.uses_qasr:
+            pool_weights = sparsemax(
+                qasr_evidence["score"] / self.qasr_pool_temperature,
+                dim=-1,
+            )
+            mean_prototype = refined_nodes.mean(dim=1)
+            selected_prototype = (
+                pool_weights.unsqueeze(-1) * refined_nodes
+            ).sum(dim=1)
+            tiny = torch.finfo(pool_weights.dtype).tiny
+            if support_count == 1:
+                normalized_entropy = torch.zeros(
+                    batch_size,
+                    dtype=pool_weights.dtype,
+                    device=pool_weights.device,
+                )
+            else:
+                normalized_entropy = -(
+                    pool_weights * pool_weights.clamp_min(tiny).log()
+                ).sum(dim=-1) / np.log(float(support_count))
+            selection_confidence = (1.0 - normalized_entropy).clamp(0.0, 1.0)
+            memory_confidence = qasr_evidence[
+                "metadata_reliability"
+            ].mean(dim=-1)
+            correction_gate = (
+                memory_confidence * selection_confidence
+            ).clamp(0.0, 1.0)
+            refined_feat = mean_prototype + (
+                self.qasr_residual_strength
+                * correction_gate.unsqueeze(-1)
+                * (selected_prototype - mean_prototype)
+            )
         else:
             pool_weights = torch.full(
                 (batch_size, support_count),
@@ -308,7 +566,13 @@ class GraphRefiner(nn.Module):
             )
             refined_feat = refined_nodes.mean(dim=1)
 
-        self._record_diagnostics(utility, pool_weights, message_weights)
+        self._record_diagnostics(
+            utility,
+            pool_weights,
+            message_weights,
+            qasr_evidence=qasr_evidence,
+            correction_gate=correction_gate,
+        )
         return F.normalize(refined_feat, p=2, dim=-1, eps=self.eps)
 
 
@@ -323,6 +587,13 @@ def build_graph_refiner(opt, device):
         pool_temperature=opt.refiner_pool_temperature,
         message_prior_strength=opt.refiner_message_prior_strength,
         detach_utility=not opt.refiner_end_to_end_utility,
+        qasr_pool_temperature=opt.refiner_qasr_pool_temperature,
+        qasr_query_weight=opt.refiner_qasr_query_weight,
+        qasr_consensus_weight=opt.refiner_qasr_consensus_weight,
+        qasr_metadata_weight=opt.refiner_qasr_metadata_weight,
+        qasr_graph_strength=opt.refiner_qasr_graph_strength,
+        qasr_residual_strength=opt.refiner_qasr_residual_strength,
+        detach_qasr_evidence=not opt.refiner_qasr_end_to_end_evidence,
         eps=opt.refiner_eps,
     ).to(device)
 
@@ -461,6 +732,19 @@ def _validate_resume_config(opt, saved_opt):
         "i2t",
         "t2i",
     )
+    if (
+        getattr(opt, "refiner_mode", None) == "qasr_full"
+        or getattr(saved_opt, "refiner_mode", None) == "qasr_full"
+    ):
+        critical += (
+            "refiner_qasr_pool_temperature",
+            "refiner_qasr_query_weight",
+            "refiner_qasr_consensus_weight",
+            "refiner_qasr_metadata_weight",
+            "refiner_qasr_graph_strength",
+            "refiner_qasr_residual_strength",
+            "refiner_qasr_end_to_end_evidence",
+        )
     mismatches = []
     for name in critical:
         current = getattr(opt, name, None)

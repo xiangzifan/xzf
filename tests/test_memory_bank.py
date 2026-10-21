@@ -25,6 +25,24 @@ class TinyRefiner(nn.Module):
         return F.normalize(self.projection(neighbors).mean(dim=1), dim=-1)
 
 
+class MetadataRecordingRefiner(nn.Module):
+    """Records the selected RESB metadata passed to a QASR-style refiner."""
+
+    requires_support_metadata = True
+
+    def forward(
+        self,
+        neighbors,
+        query_feats=None,
+        support_quality=None,
+        support_freshness=None,
+    ):
+        self.last_query_feats = query_feats
+        self.last_quality = support_quality
+        self.last_freshness = support_freshness
+        return F.normalize(neighbors.mean(dim=1), dim=-1)
+
+
 class MemoryBankTests(unittest.TestCase):
     def test_subset_reconstruction_preserves_original_record_ids(self):
         captions = ["caption {}".format(index) for index in range(6)]
@@ -224,6 +242,55 @@ class MemoryBankTests(unittest.TestCase):
         self.assertIs(refiner.last_query_feats, query)
         self.assertIsNotNone(refiner.projection.weight.grad)
         self.assertTrue(torch.isfinite(refiner.projection.weight.grad).all())
+
+    def test_selected_support_metadata_is_aligned_with_qasr_values(self):
+        bank = MemoryQueue(
+            queue_size=4,
+            dim=3,
+            mode="quality_diverse",
+            candidate_pool_size=3,
+            quality_weight=0.0,
+            freshness_weight=0.0,
+            mmr_balance=1.0,
+            freshness_tau=2.0,
+            device=torch.device("cpu"),
+        )
+        keys = unit_rows([1, 0, 0], [0.8, 0.6, 0], [0, 1, 0])
+        values = unit_rows([0, 1, 0], [0, 0, 1], [1, 0, 0])
+        bank.enqueue(
+            keys,
+            values,
+            record_ids=[1, 2, 3],
+            clean_prob=[0.9, 0.7, 0.5],
+            current_epoch=1,
+        )
+        refiner = MetadataRecordingRefiner()
+        query = unit_rows([1, 0, 0])
+        bank.retrieve_nearest_text(
+            query,
+            k=2,
+            refiner_node=refiner,
+            query_ids=[99],
+            current_epoch=3,
+        )
+        selected = bank._select_supports(
+            query,
+            bank.img_queue,
+            bank.txt_queue,
+            k=2,
+            query_ids=[99],
+            current_epoch=3,
+        )
+        _, selected_indices = selected
+        expected_quality = bank.quality[selected_indices]
+        expected_freshness = torch.exp(
+            -(3 - bank.last_seen[selected_indices]).float() / bank.freshness_tau
+        )
+        self.assertIs(refiner.last_query_feats, query)
+        self.assertTrue(torch.equal(refiner.last_quality, expected_quality))
+        self.assertTrue(
+            torch.allclose(refiner.last_freshness, expected_freshness, atol=1e-7)
+        )
 
 
 if __name__ == "__main__":

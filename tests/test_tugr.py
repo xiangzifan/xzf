@@ -21,6 +21,7 @@ from co_train import (
     ensure_rectification_modules,
     load_rectification_state_dict,
     rectification_state_dict,
+    sparsemax,
 )
 from utils import save_checkpoint
 
@@ -68,6 +69,16 @@ class GraphRefinerTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(actual, expected, atol=1e-7, rtol=1e-6))
 
+    def test_sparsemax_projects_to_sparse_probability_simplex(self):
+        logits = torch.tensor([[2.0, 0.0, -1.0], [0.0, 0.0, 0.0]])
+        probabilities = sparsemax(logits, dim=-1)
+        expected = torch.tensor([[1.0, 0.0, 0.0], [1 / 3, 1 / 3, 1 / 3]])
+        self.assertTrue(torch.allclose(probabilities, expected, atol=1e-6))
+        self.assertTrue((probabilities >= 0).all())
+        self.assertTrue(
+            torch.allclose(probabilities.sum(dim=-1), torch.ones(2), atol=1e-7)
+        )
+
     def test_discriminative_utility_matches_two_query_closed_form(self):
         refiner = GraphRefiner(
             dim=2,
@@ -105,13 +116,17 @@ class GraphRefinerTests(unittest.TestCase):
     def test_all_factorial_modes_return_unit_norm_outputs(self):
         queries = F.normalize(torch.randn(5, 8), dim=-1)
         supports = F.normalize(torch.randn(5, 3, 8), dim=-1)
-        for mode in ("mean", "dua_pool", "qdmp_mean", "tugr_full"):
+        for mode in ("mean", "dua_pool", "qdmp_mean", "tugr_full", "qasr_full"):
             refiner = GraphRefiner(
                 dim=8, k=3, n_heads=2, dropout=0.0, mode=mode
             )
-            output = refiner(
-                supports, query_feats=queries if mode != "mean" else None
-            )
+            kwargs = {"query_feats": queries} if mode != "mean" else {}
+            if mode == "qasr_full":
+                kwargs.update(
+                    support_quality=torch.full((5, 3), 0.9),
+                    support_freshness=torch.full((5, 3), 0.8),
+                )
+            output = refiner(supports, **kwargs)
             self.assertEqual(tuple(output.shape), (5, 8))
             self.assertTrue(torch.isfinite(output).all())
             self.assertTrue(
@@ -121,6 +136,108 @@ class GraphRefinerTests(unittest.TestCase):
             self.assertEqual(diagnostics["calls"], 1)
             self.assertEqual(diagnostics["queries"], 5)
             self.assertLess(diagnostics["pool_sum_error"], 1e-6)
+
+    def test_qasr_uniform_evidence_falls_back_to_legacy_mean_path(self):
+        qasr = GraphRefiner(
+            dim=4,
+            k=3,
+            n_heads=2,
+            dropout=0.0,
+            mode="qasr_full",
+        ).eval()
+        legacy = GraphRefiner(
+            dim=4, k=3, n_heads=2, dropout=0.0, mode="mean"
+        ).eval()
+        legacy.load_state_dict(qasr.state_dict(), strict=True)
+        supports = torch.tensor(
+            [[[1.0, 0.0, 0.0, 0.0],
+              [0.0, 1.0, 0.0, 0.0],
+              [0.0, 0.0, 1.0, 0.0]]]
+        )
+        query = F.normalize(torch.tensor([[1.0, 1.0, 1.0, 0.0]]), dim=-1)
+        metadata = torch.full((1, 3), 0.8)
+        with torch.no_grad():
+            expected = legacy(supports)
+            actual = qasr(
+                supports,
+                query_feats=query,
+                support_quality=metadata,
+                support_freshness=metadata,
+            )
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
+        diagnostics = qasr.diagnostics()
+        self.assertAlmostEqual(diagnostics["effective_k"], 3.0, places=5)
+        self.assertAlmostEqual(diagnostics["qasr_correction_gate"], 0.0, places=5)
+
+    def test_qasr_evidence_uses_query_consensus_and_memory_metadata(self):
+        refiner = GraphRefiner(
+            dim=3,
+            k=3,
+            n_heads=1,
+            dropout=0.0,
+            mode="qasr_full",
+            qasr_query_weight=1.0,
+            qasr_consensus_weight=1.0,
+            qasr_metadata_weight=1.0,
+        )
+        query = torch.tensor([[1.0, 0.0, 0.0]])
+        supports = torch.tensor(
+            [[[1.0, 0.0, 0.0], [0.8, 0.6, 0.0], [-1.0, 0.0, 0.0]]]
+        )
+        quality = torch.tensor([[1.0, 0.5, 0.0]])
+        freshness = torch.tensor([[1.0, 0.5, 1.0]])
+        evidence = refiner.compute_qasr_evidence(
+            query, supports, quality, freshness
+        )
+        for values in evidence.values():
+            self.assertTrue(torch.isfinite(values).all())
+            self.assertTrue(((values >= 0) & (values <= 1)).all())
+        self.assertGreater(
+            float(evidence["score"][0, 0]),
+            float(evidence["score"][0, 2]),
+        )
+
+    def test_qasr_requires_aligned_memory_metadata(self):
+        refiner = GraphRefiner(
+            dim=8, k=3, n_heads=2, dropout=0.0, mode="qasr_full"
+        )
+        supports = torch.randn(2, 3, 8)
+        queries = torch.randn(2, 8)
+        with self.assertRaises(ValueError):
+            refiner(supports, query_feats=queries)
+        with self.assertRaises(ValueError):
+            refiner(
+                supports,
+                query_feats=queries,
+                support_quality=torch.ones(2, 2),
+                support_freshness=torch.ones(2, 3),
+            )
+
+    def test_qasr_trainable_path_has_finite_gradients(self):
+        refiner = GraphRefiner(
+            dim=8,
+            k=3,
+            n_heads=2,
+            dropout=0.0,
+            mode="qasr_full",
+        )
+        queries = F.normalize(torch.randn(4, 8), dim=-1)
+        supports = F.normalize(torch.randn(4, 3, 8), dim=-1)
+        metadata = torch.full((4, 3), 0.9)
+        output = refiner(
+            supports,
+            query_feats=queries,
+            support_quality=metadata,
+            support_freshness=metadata,
+        )
+        output[:, 0].sum().backward()
+        trainable = [
+            parameter for parameter in refiner.parameters() if parameter.requires_grad
+        ]
+        self.assertTrue(any(parameter.grad is not None for parameter in trainable))
+        for parameter in trainable:
+            if parameter.grad is not None:
+                self.assertTrue(torch.isfinite(parameter.grad).all())
 
     def test_qdmp_and_dua_parameters_receive_finite_gradients(self):
         refiner = GraphRefiner(
@@ -168,11 +285,18 @@ class GraphRefinerTests(unittest.TestCase):
             learning_rate=5e-4,
             refiner_heads=2,
             refiner_dropout=0.0,
-            refiner_mode="tugr_full",
+            refiner_mode="qasr_full",
             refiner_utility_temperature=0.1,
             refiner_pool_temperature=0.1,
             refiner_message_prior_strength=0.5,
             refiner_end_to_end_utility=False,
+            refiner_qasr_pool_temperature=0.25,
+            refiner_qasr_query_weight=1.0,
+            refiner_qasr_consensus_weight=0.5,
+            refiner_qasr_metadata_weight=0.25,
+            refiner_qasr_graph_strength=0.5,
+            refiner_qasr_residual_strength=1.0,
+            refiner_qasr_end_to_end_evidence=False,
             refiner_eps=1e-6,
             queue_size=8,
             memory_mode="quality_diverse",

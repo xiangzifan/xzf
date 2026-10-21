@@ -409,8 +409,29 @@ class MemoryQueue:
         )
         if selected is None:
             return None
-        neighbor_values, _ = selected
+        neighbor_values, selected_indices = selected
         if refiner_node is not None:
+            if getattr(refiner_node, "requires_support_metadata", False):
+                if self.mode != "quality_diverse":
+                    raise RuntimeError(
+                        "metadata-aware refiner requires quality_diverse Memory"
+                    )
+                support_quality = self.quality[: self.size][
+                    selected_indices
+                ].to(dtype=neighbor_values.dtype)
+                support_age = (
+                    int(current_epoch)
+                    - self.last_seen[: self.size][selected_indices]
+                ).clamp_min(0).to(dtype=neighbor_values.dtype)
+                support_freshness = torch.exp(
+                    -support_age / self.freshness_tau
+                )
+                return refiner_node(
+                    neighbor_values,
+                    query_feats=query_feats,
+                    support_quality=support_quality,
+                    support_freshness=support_freshness,
+                )
             return refiner_node(neighbor_values, query_feats=query_feats)
         return F.normalize(
             neighbor_values.mean(dim=1), p=2, dim=-1, eps=self.eps
