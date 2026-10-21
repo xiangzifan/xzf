@@ -68,16 +68,27 @@ def load_config(opt, file_path):
 def save_checkpoint(state, is_best, filename="checkpoint.pth.tar", prefix=""):
     tries = 15
     error = None
+    destination = prefix + filename
+    temporary = destination + ".tmp"
+    best_temporary = None
 
     # deal with unstable I/O. Usually not necessary.
     while tries:
         try:
-            torch.save(state, prefix + filename)
+            torch.save(state, temporary)
+            os.replace(temporary, destination)
             if is_best:
-                shutil.copyfile(prefix + filename, prefix + "model_best.pth.tar")
-        except IOError as e:
+                best_destination = prefix + "model_best.pth.tar"
+                best_temporary = best_destination + ".tmp"
+                shutil.copyfile(destination, best_temporary)
+                os.replace(best_temporary, best_destination)
+        except (OSError, RuntimeError) as e:
             error = e
             tries -= 1
+            if os.path.exists(temporary):
+                os.remove(temporary)
+            if best_temporary and os.path.exists(best_temporary):
+                os.remove(best_temporary)
         else:
             break
         logger.info("model save {} failed, remaining {} trials".format(filename, tries))

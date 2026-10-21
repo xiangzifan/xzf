@@ -411,7 +411,7 @@ class MemoryQueue:
             return None
         neighbor_values, _ = selected
         if refiner_node is not None:
-            return refiner_node(neighbor_values)
+            return refiner_node(neighbor_values, query_feats=query_feats)
         return F.normalize(
             neighbor_values.mean(dim=1), p=2, dim=-1, eps=self.eps
         )
@@ -510,28 +510,30 @@ class MemoryQueue:
         return result
 
     def state_dict(self) -> Dict[str, object]:
-        """Capture the complete runtime state for a future strict resume path."""
+        """Capture complete runtime state using compact valid-prefix tensors."""
+        valid = slice(0, self.size)
         return {
-            "schema": 1,
+            "schema": 2,
             "mode": self.mode,
             "queue_size": self.queue_size,
             "dim": self.dim,
             "ptr": self.ptr,
             "size": self.size,
             "is_full": self.is_full,
-            "img_queue": self.img_queue.detach().clone(),
-            "txt_queue": self.txt_queue.detach().clone(),
-            "record_ids": self.record_ids.detach().clone(),
-            "quality": self.quality.detach().clone(),
-            "last_seen": self.last_seen.detach().clone(),
-            "update_count": self.update_count.detach().clone(),
+            "img_queue": self.img_queue[valid].detach().clone(),
+            "txt_queue": self.txt_queue[valid].detach().clone(),
+            "record_ids": self.record_ids[valid].detach().clone(),
+            "quality": self.quality[valid].detach().clone(),
+            "last_seen": self.last_seen[valid].detach().clone(),
+            "update_count": self.update_count[valid].detach().clone(),
             "stats": dict(self._stats),
         }
 
     @torch.no_grad()
     def load_state_dict(self, state: Dict[str, object]) -> None:
         """Restore a state produced by :meth:`state_dict` with strict checks."""
-        if state.get("schema") != 1:
+        schema = state.get("schema")
+        if schema not in {1, 2}:
             raise ValueError("unsupported memory-state schema")
         for key, expected in (
             ("mode", self.mode),
@@ -541,6 +543,24 @@ class MemoryQueue:
             if state.get(key) != expected:
                 raise ValueError("memory-state {} mismatch".format(key))
 
+        restored_ptr = int(state["ptr"])
+        restored_size = int(state["size"])
+        restored_full = bool(state["is_full"])
+        if not 0 <= restored_ptr < self.queue_size:
+            raise ValueError("invalid restored memory pointer")
+        if not 0 <= restored_size <= self.queue_size:
+            raise ValueError("invalid restored memory size")
+        if restored_full != (restored_size == self.queue_size):
+            raise ValueError("inconsistent restored full flag")
+
+        defaults = {
+            "img_queue": 0,
+            "txt_queue": 0,
+            "record_ids": -1,
+            "quality": 0,
+            "last_seen": -1,
+            "update_count": 0,
+        }
         for name in (
             "img_queue",
             "txt_queue",
@@ -551,19 +571,24 @@ class MemoryQueue:
         ):
             destination = getattr(self, name)
             source = state[name]
-            if not isinstance(source, torch.Tensor) or source.shape != destination.shape:
+            expected_shape = destination.shape
+            if schema == 2:
+                expected_shape = (restored_size,) + destination.shape[1:]
+            if not isinstance(source, torch.Tensor) or source.shape != expected_shape:
                 raise ValueError("invalid tensor state for {}".format(name))
-            destination.copy_(source.to(device=self.device, dtype=destination.dtype))
+            if schema == 1:
+                destination.copy_(
+                    source.to(device=self.device, dtype=destination.dtype)
+                )
+            else:
+                destination.fill_(defaults[name])
+                destination[:restored_size].copy_(
+                    source.to(device=self.device, dtype=destination.dtype)
+                )
 
-        self.ptr = int(state["ptr"])
-        self.size = int(state["size"])
-        self.is_full = bool(state["is_full"])
-        if not 0 <= self.ptr < self.queue_size:
-            raise ValueError("invalid restored memory pointer")
-        if not 0 <= self.size <= self.queue_size:
-            raise ValueError("invalid restored memory size")
-        if self.is_full != (self.size == self.queue_size):
-            raise ValueError("inconsistent restored full flag")
+        self.ptr = restored_ptr
+        self.size = restored_size
+        self.is_full = restored_full
 
         self._id_to_slot = {}
         if self.mode != "fifo":

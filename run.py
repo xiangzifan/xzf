@@ -43,6 +43,15 @@ def run():
         "--num_epochs", default=40, type=int, help="Number of training epochs."
     )
     parser.add_argument(
+        "--co_train_epochs",
+        default=0,
+        type=int,
+        help=(
+            "Number of co-training epochs to execute; 0 uses num_epochs. This "
+            "can preserve a 40-epoch LR horizon while running the fixed-20 protocol."
+        ),
+    )
+    parser.add_argument(
         "--lr_update",
         default=15,
         type=int,
@@ -128,6 +137,11 @@ def run():
     parser.add_argument("--warmup_epoch", default=5, type=int, help="warm up epochs")
     parser.add_argument("--warmup_model_path", default="", help="warm up models")
     parser.add_argument(
+        "--resume",
+        default="",
+        help="Strictly resume a TUGR co-training checkpoint at an epoch boundary.",
+    )
+    parser.add_argument(
         "--p_threshold", default=0.5, type=float, help="clean probability threshold"
     )
     parser.add_argument(
@@ -148,6 +162,59 @@ def run():
     )
     parser.add_argument(
         "--k", default=5, type=int, help="Number of intra-modal neighbors K."
+    )
+    parser.add_argument(
+        "--refiner_mode",
+        default="tugr_full",
+        choices=["mean", "dua_pool", "qdmp_mean", "tugr_full"],
+        help=(
+            "GraphRefiner 2x2 mode: original messages/mean, original messages/DUA, "
+            "QDMP/mean, or the full QDMP+DUA model."
+        ),
+    )
+    parser.add_argument(
+        "--refiner_heads",
+        default=4,
+        type=int,
+        help="Number of support self-attention heads.",
+    )
+    parser.add_argument(
+        "--refiner_dropout",
+        default=0.1,
+        type=float,
+        help="Dropout applied to the GraphRefiner message projection.",
+    )
+    parser.add_argument(
+        "--refiner_utility_temperature",
+        default=0.1,
+        type=float,
+        help="Temperature T for the DUA negative-query LogMeanExp.",
+    )
+    parser.add_argument(
+        "--refiner_pool_temperature",
+        default=0.1,
+        type=float,
+        help="Temperature used to convert DUA utilities into pooling weights.",
+    )
+    parser.add_argument(
+        "--refiner_message_prior_strength",
+        default=0.5,
+        type=float,
+        help="QDMP sender-utility logit strength lambda_u.",
+    )
+    parser.add_argument(
+        "--refiner_end_to_end_utility",
+        action="store_true",
+        help=(
+            "Allow gradients through DUA routing scores. Off by default for the "
+            "stable detached TUGR configuration."
+        ),
+    )
+    parser.add_argument(
+        "--refiner_eps",
+        default=1e-6,
+        type=float,
+        help="Numerical epsilon used by GraphRefiner normalization.",
     )
     parser.add_argument(
         "--memory_mode",
@@ -226,8 +293,36 @@ def run():
     # load arguments
     opt = parser.parse_args()
 
+    if opt.num_epochs < 1:
+        parser.error("--num_epochs must be positive")
+    if opt.batch_size < 1:
+        parser.error("--batch_size must be positive")
     if opt.k < 1 or opt.queue_size < max(opt.k, opt.batch_size):
         parser.error("--queue_size must hold at least K and one full batch")
+    if opt.co_train_epochs < 0 or opt.co_train_epochs > opt.num_epochs:
+        parser.error("--co_train_epochs must be 0 or in [1, num_epochs]")
+    if opt.resume and opt.warmup_model_path:
+        parser.error("--resume and --warmup_model_path are mutually exclusive")
+    if opt.refiner_heads < 1:
+        parser.error("--refiner_heads must be positive")
+    if opt.embed_size % opt.refiner_heads != 0:
+        parser.error("--embed_size must be divisible by --refiner_heads")
+    if not np.isfinite(opt.refiner_dropout) or not 0 <= opt.refiner_dropout < 1:
+        parser.error("--refiner_dropout must be in [0, 1)")
+    if (
+        not np.isfinite(opt.refiner_utility_temperature)
+        or not np.isfinite(opt.refiner_pool_temperature)
+        or opt.refiner_utility_temperature <= 0
+        or opt.refiner_pool_temperature <= 0
+    ):
+        parser.error("GraphRefiner temperatures must be finite and positive")
+    if (
+        not np.isfinite(opt.refiner_message_prior_strength)
+        or opt.refiner_message_prior_strength < 0
+    ):
+        parser.error("--refiner_message_prior_strength must be nonnegative")
+    if not np.isfinite(opt.refiner_eps) or opt.refiner_eps <= 0:
+        parser.error("--refiner_eps must be finite and positive")
     if opt.memory_candidate_pool_size < opt.k:
         parser.error("--memory_candidate_pool_size must be >= --k")
     if (

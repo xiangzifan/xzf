@@ -2,16 +2,14 @@
 
 import os
 import time
-import copy
-import shutil
 import random
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import numpy as np
-import torch
 from sklearn.mixture import GaussianMixture
 
 from data import get_loader, get_dataset
@@ -35,57 +33,302 @@ from utils import (
 )
 
 
+_VALID_REFINER_MODES = {"mean", "dua_pool", "qdmp_mean", "tugr_full"}
+
+
 class GraphRefiner(nn.Module):
-    def __init__(self, dim=1024, k=5, n_heads=4, dropout=0.1):
+    """Task-utility-guided support graph refinement.
+
+    Modes deliberately form a 2x2 factorial design:
+
+    ``mean``
+        Original support self-attention followed by equal mean pooling.
+    ``dua_pool``
+        Original messages followed by discriminative-utility pooling.
+    ``qdmp_mean``
+        Query-conditioned discriminative message passing followed by mean.
+    ``tugr_full``
+        QDMP messages and DUA pooling (the proposed full model).
+
+    The utility is derived only from train-visible query/support embeddings.  It
+    never consumes synthetic clean/noisy ground-truth labels.  By default it is
+    detached before it changes messages or pooling, which prevents the encoder
+    from manipulating the routing score as a shortcut while preserving normal
+    gradients through the refined support representations.
+    """
+
+    def __init__(
+        self,
+        dim=1024,
+        k=5,
+        n_heads=4,
+        dropout=0.1,
+        mode="tugr_full",
+        utility_temperature=0.1,
+        pool_temperature=0.1,
+        message_prior_strength=0.5,
+        detach_utility=True,
+        eps=1e-6,
+    ):
         super(GraphRefiner, self).__init__()
-        self.k = k
-        self.n_heads = n_heads
-        self.d_k = dim // n_heads
+        if dim < 1 or k < 1 or n_heads < 1:
+            raise ValueError("dim, k, and n_heads must be positive")
+        if dim % n_heads != 0:
+            raise ValueError("dim must be divisible by n_heads")
+        if mode not in _VALID_REFINER_MODES:
+            raise ValueError("unsupported refiner mode: {}".format(mode))
+        if utility_temperature <= 0 or pool_temperature <= 0 or eps <= 0:
+            raise ValueError("temperatures and eps must be positive")
+        if message_prior_strength < 0:
+            raise ValueError("message_prior_strength must be nonnegative")
 
-        # 线性变换，映射到一个适合计算关系的映射空间
-        # self.embedding_layer = nn.Linear(dim, dim)
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        # 注意力机制：用于计算节点间的相互权重
-        # self.attn_fc = nn.Linear(2 * dim, 1)
-        # 2. 边权重推理：不仅计算节点相似度，还学习节点间的相对关系
-        # 我们构建一个边特征生成器
+        self.dim = int(dim)
+        self.k = int(k)
+        self.n_heads = int(n_heads)
+        self.d_k = self.dim // self.n_heads
+        self.mode = mode
+        self.utility_temperature = float(utility_temperature)
+        self.pool_temperature = float(pool_temperature)
+        self.message_prior_strength = float(message_prior_strength)
+        self.detach_utility = bool(detach_utility)
+        self.eps = float(eps)
+
+        self.q_proj = nn.Linear(self.dim, self.dim)
+        self.k_proj = nn.Linear(self.dim, self.dim)
+        self.v_proj = nn.Linear(self.dim, self.dim)
+
+        # Retained, but frozen, for state/init compatibility with A5-Delete.
+        # The released A5 path declared edge_nn but never used it in forward.
         self.edge_nn = nn.Sequential(
-            nn.Linear(dim * 2, dim // 2),
+            nn.Linear(self.dim * 2, self.dim // 2),
             nn.LeakyReLU(0.2),
-            nn.Linear(dim // 2, 1),
-            nn.Sigmoid()
+            nn.Linear(self.dim // 2, 1),
+            nn.Sigmoid(),
         )
-        
-        # 3. 输出层与残差连接
-        self.output_layer = nn.Linear(dim, dim)
-        self.layer_norm = nn.LayerNorm(dim)
-        self.dropout = nn.Dropout(dropout)
+        self.edge_nn.requires_grad_(False)
 
-    def forward(self, neighbors):
+        self.output_layer = nn.Linear(self.dim, self.dim)
+        self.layer_norm = nn.LayerNorm(self.dim)
+        self.dropout = nn.Dropout(dropout)
+        self._diagnostic_sums = defaultdict(float)
+        self._diagnostic_counts = defaultdict(int)
+
+    @property
+    def uses_utility(self):
+        return self.mode != "mean"
+
+    @property
+    def uses_qdmp(self):
+        return self.mode in {"qdmp_mean", "tugr_full"}
+
+    @property
+    def uses_dua_pool(self):
+        return self.mode in {"dua_pool", "tugr_full"}
+
+    def reset_diagnostics(self):
+        self._diagnostic_sums.clear()
+        self._diagnostic_counts.clear()
+
+    def _record_scalar(self, name, value, weight=1):
+        self._diagnostic_sums[name] += float(value.detach().item()) * int(weight)
+        self._diagnostic_counts[name] += int(weight)
+
+    def diagnostics(self):
+        result = {
+            "mode": self.mode,
+            "calls": int(self._diagnostic_counts.get("calls", 0)),
+            "queries": int(self._diagnostic_counts.get("queries", 0)),
+        }
+        for name, total in self._diagnostic_sums.items():
+            count = self._diagnostic_counts.get(name, 0)
+            if count:
+                result[name] = total / count
+        return result
+
+    def _validate_inputs(self, neighbors, query_feats):
+        if neighbors.ndim != 3:
+            raise ValueError("neighbors must have shape [batch, k, dim]")
+        batch_size, support_count, dim = neighbors.shape
+        if support_count != self.k:
+            raise ValueError(
+                "expected {} supports, received {}".format(self.k, support_count)
+            )
+        if dim != self.dim:
+            raise ValueError(
+                "expected feature dimension {}, received {}".format(self.dim, dim)
+            )
+        if not torch.isfinite(neighbors).all():
+            raise ValueError("neighbors must be finite")
+        if self.uses_utility:
+            if query_feats is None:
+                raise ValueError("query_feats are required by mode {}".format(self.mode))
+            if query_feats.shape != (batch_size, self.dim):
+                raise ValueError("query_feats must have shape [batch, dim]")
+            if query_feats.device != neighbors.device:
+                raise ValueError("query_feats and neighbors must share a device")
+            if query_feats.dtype != neighbors.dtype:
+                raise ValueError("query_feats and neighbors must share a dtype")
+            if not torch.isfinite(query_feats).all():
+                raise ValueError("query_feats must be finite")
+
+    def compute_discriminative_utility(self, query_feats, neighbors):
+        """Return DUA utility with shape [batch, k].
+
+        For support ``j`` retrieved for query ``i`` the positive term is its
+        cosine similarity to query ``i``.  The negative term is a temperature-
+        scaled LogMeanExp over all other queries in the current mini-batch.
+        Batch size one has no negatives and therefore falls back to the positive
+        cosine term instead of producing an undefined value.
         """
-        neighbors: shape [batch_size, k, dim] - 检索到的K个邻居
-        """
-        bs, k, dim = neighbors.size()
-        
-        # --- 多头图注意力机制 (Multi-head Graph Attention) ---
-        # 计算 Q, K, V
-        q = self.q_proj(neighbors).view(bs, k, self.n_heads, self.d_k).transpose(1, 2)
-        k_val = self.k_proj(neighbors).view(bs, k, self.n_heads, self.d_k).transpose(1, 2)
-        v = self.v_proj(neighbors).view(bs, k, self.n_heads, self.d_k).transpose(1, 2)
-        
-        # 缩放点积注意力 [bs, heads, k+1, k+1]
-        attn_scores = torch.matmul(q, k_val.transpose(-2, -1)) / (self.d_k ** 0.5)
-        weights = F.softmax(attn_scores, dim=-1)
-        context = torch.matmul(weights, v).transpose(1, 2).contiguous().view(bs, k, dim)
-        neighbors = self.layer_norm(neighbors + self.dropout(self.output_layer(context)))
-        refined_feat = neighbors.mean(dim=1)
-        return F.normalize(refined_feat, p=2, dim=-1)
+        normalized_queries = F.normalize(
+            query_feats, p=2, dim=-1, eps=self.eps
+        )
+        normalized_supports = F.normalize(
+            neighbors, p=2, dim=-1, eps=self.eps
+        )
+        batch_size = query_feats.size(0)
+        # One GEMM is substantially faster than a Python loop/einsum for the
+        # [source_query, owner_query, support] similarity tensor.
+        all_similarities = torch.matmul(
+            normalized_queries,
+            normalized_supports.reshape(batch_size * self.k, self.dim).t(),
+        ).view(batch_size, batch_size, self.k)
+        owner = torch.arange(batch_size, device=query_feats.device)
+        positive = all_similarities[owner, owner]
+        if batch_size == 1:
+            utility = positive
+        else:
+            negative_mask = ~torch.eye(
+                batch_size, dtype=torch.bool, device=query_feats.device
+            )
+            negative_logits = all_similarities.masked_fill(
+                ~negative_mask[:, :, None], -torch.inf
+            )
+            negative_lme = self.utility_temperature * (
+                torch.logsumexp(
+                    negative_logits / self.utility_temperature, dim=0
+                )
+                - np.log(batch_size - 1)
+            )
+            utility = positive - negative_lme
+        if self.detach_utility:
+            utility = utility.detach()
+        return utility
+
+    def _standardize_utility(self, utility):
+        centered = utility - utility.mean(dim=-1, keepdim=True)
+        variance = centered.square().mean(dim=-1, keepdim=True)
+        return centered / variance.add(self.eps).sqrt()
+
+    def _record_diagnostics(self, utility, pool_weights, message_weights):
+        batch_size = pool_weights.size(0)
+        tiny = torch.finfo(pool_weights.dtype).tiny
+        pool_entropy = -(
+            pool_weights * pool_weights.clamp_min(tiny).log()
+        ).sum(dim=-1)
+        effective_k = pool_weights.square().sum(dim=-1).clamp_min(
+            self.eps
+        ).reciprocal()
+        pool_sum_error = (pool_weights.sum(dim=-1) - 1.0).abs()
+
+        self._diagnostic_counts["calls"] += 1
+        self._diagnostic_counts["queries"] += batch_size
+        self._record_scalar(
+            "pool_top1", pool_weights.max(dim=-1).values.mean(), batch_size
+        )
+        self._record_scalar("pool_entropy", pool_entropy.mean(), batch_size)
+        self._record_scalar("effective_k", effective_k.mean(), batch_size)
+        self._record_scalar("pool_sum_error", pool_sum_error.max())
+        if utility is not None:
+            self._record_scalar("utility_mean", utility.mean(), batch_size)
+            self._record_scalar(
+                "utility_std", utility.std(unbiased=False), batch_size
+            )
+        if message_weights is not None:
+            message_tiny = torch.finfo(message_weights.dtype).tiny
+            message_entropy = -(
+                message_weights
+                * message_weights.clamp_min(message_tiny).log()
+            ).sum(dim=-1)
+            self._record_scalar(
+                "message_entropy", message_entropy.mean(), batch_size
+            )
+
+    def forward(self, neighbors, query_feats=None):
+        """Refine a retrieved support set into one normalized prototype."""
+        self._validate_inputs(neighbors, query_feats)
+        batch_size, support_count, dim = neighbors.size()
+
+        utility = None
+        if self.uses_utility:
+            utility = self.compute_discriminative_utility(query_feats, neighbors)
+
+        projected_queries = self.q_proj(neighbors).view(
+            batch_size, support_count, self.n_heads, self.d_k
+        ).transpose(1, 2)
+        projected_keys = self.k_proj(neighbors).view(
+            batch_size, support_count, self.n_heads, self.d_k
+        ).transpose(1, 2)
+        projected_values = self.v_proj(neighbors).view(
+            batch_size, support_count, self.n_heads, self.d_k
+        ).transpose(1, 2)
+
+        attention_logits = torch.matmul(
+            projected_queries, projected_keys.transpose(-2, -1)
+        ) / (self.d_k ** 0.5)
+        if self.uses_qdmp:
+            standardized_utility = self._standardize_utility(utility)
+            attention_logits = attention_logits + (
+                self.message_prior_strength
+                * standardized_utility[:, None, None, :]
+            )
+
+        message_weights = F.softmax(attention_logits, dim=-1)
+        context = torch.matmul(message_weights, projected_values)
+        context = context.transpose(1, 2).contiguous().view(
+            batch_size, support_count, dim
+        )
+        refined_nodes = self.layer_norm(
+            neighbors + self.dropout(self.output_layer(context))
+        )
+
+        if self.uses_dua_pool:
+            pool_weights = F.softmax(
+                utility / self.pool_temperature, dim=-1
+            )
+            refined_feat = (
+                pool_weights.unsqueeze(-1) * refined_nodes
+            ).sum(dim=1)
+        else:
+            pool_weights = torch.full(
+                (batch_size, support_count),
+                1.0 / support_count,
+                dtype=neighbors.dtype,
+                device=neighbors.device,
+            )
+            refined_feat = refined_nodes.mean(dim=1)
+
+        self._record_diagnostics(utility, pool_weights, message_weights)
+        return F.normalize(refined_feat, p=2, dim=-1, eps=self.eps)
+
+
+def build_graph_refiner(opt, device):
+    return GraphRefiner(
+        dim=opt.embed_size,
+        k=opt.k,
+        n_heads=opt.refiner_heads,
+        dropout=opt.refiner_dropout,
+        mode=opt.refiner_mode,
+        utility_temperature=opt.refiner_utility_temperature,
+        pool_temperature=opt.refiner_pool_temperature,
+        message_prior_strength=opt.refiner_message_prior_strength,
+        detach_utility=not opt.refiner_end_to_end_utility,
+        eps=opt.refiner_eps,
+    ).to(device)
 
 
 def build_memory_queue(opt):
-    """Construct the selected Memory ablation without changing GraphRefiner."""
+    """Construct the selected Memory ablation."""
     return MemoryQueue(
         queue_size=opt.queue_size,
         dim=opt.embed_size,
@@ -99,6 +342,136 @@ def build_memory_queue(opt):
         alpha_max=opt.memory_alpha_max,
         quality_momentum=opt.memory_quality_momentum,
     )
+
+
+def _model_device(net):
+    return next(net.img_enc.parameters()).device
+
+
+def _trainable_parameters(module):
+    return [parameter for parameter in module.parameters() if parameter.requires_grad]
+
+
+def _optimizer_parameters(optimizer):
+    """Return every unique parameter owned by an optimizer."""
+    parameters = []
+    seen = set()
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            identity = id(parameter)
+            if identity not in seen:
+                seen.add(identity)
+                parameters.append(parameter)
+    return parameters
+
+
+def ensure_rectification_modules(opt, net):
+    """Create Memory and both refiners exactly once and register optimizer groups."""
+    device = _model_device(net)
+    if not hasattr(net, "memory_queue"):
+        net.memory_queue = build_memory_queue(opt)
+    if net.memory_queue.device != device:
+        raise RuntimeError("memory queue and encoder must share a device")
+
+    for attribute in ("i2t_refiner_node", "t2i_refiner_node"):
+        if hasattr(net, attribute):
+            continue
+        refiner = build_graph_refiner(opt, device)
+        setattr(net, attribute, refiner)
+        parameters = _trainable_parameters(refiner)
+        if parameters:
+            net.optimizer.add_param_group(
+                {"params": parameters, "lr": opt.learning_rate}
+            )
+
+
+def rectification_state_dict(net):
+    """Serialize state that VSE.state_dict() does not include."""
+    required = ("memory_queue", "i2t_refiner_node", "t2i_refiner_node")
+    missing = [name for name in required if not hasattr(net, name)]
+    if missing:
+        raise RuntimeError("missing rectification modules: {}".format(missing))
+    return {
+        "schema": 1,
+        "memory_queue": net.memory_queue.state_dict(),
+        "i2t_refiner": net.i2t_refiner_node.state_dict(),
+        "t2i_refiner": net.t2i_refiner_node.state_dict(),
+    }
+
+
+def load_rectification_state_dict(net, state):
+    if state.get("schema") != 1:
+        raise ValueError("unsupported rectification-state schema")
+    net.memory_queue.load_state_dict(state["memory_queue"])
+    net.i2t_refiner_node.load_state_dict(state["i2t_refiner"], strict=True)
+    net.t2i_refiner_node.load_state_dict(state["t2i_refiner"], strict=True)
+
+
+def capture_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _validate_resume_config(opt, saved_opt):
+    critical = (
+        "data_name",
+        "noise_ratio",
+        "seed",
+        "batch_size",
+        "num_epochs",
+        "learning_rate",
+        "lr_scheduler",
+        "lambda_intra",
+        "margin",
+        "embed_size",
+        "k",
+        "queue_size",
+        "memory_mode",
+        "memory_candidate_pool_size",
+        "memory_quality_weight",
+        "memory_freshness_weight",
+        "memory_freshness_tau",
+        "memory_mmr_balance",
+        "memory_alpha_min",
+        "memory_alpha_max",
+        "memory_quality_momentum",
+        "refiner_mode",
+        "refiner_heads",
+        "refiner_dropout",
+        "refiner_utility_temperature",
+        "refiner_pool_temperature",
+        "refiner_message_prior_strength",
+        "refiner_end_to_end_utility",
+        "refiner_eps",
+        "i2t",
+        "t2i",
+    )
+    mismatches = []
+    for name in critical:
+        current = getattr(opt, name, None)
+        previous = getattr(saved_opt, name, None)
+        if current != previous:
+            mismatches.append("{}: current={!r}, saved={!r}".format(
+                name, current, previous
+            ))
+    if mismatches:
+        raise ValueError(
+            "resume configuration mismatch:\n  " + "\n  ".join(mismatches)
+        )
 
 
 def main(opt):
@@ -160,63 +533,96 @@ def main(opt):
     state_dict = model_A.state_dict()
     model_B.load_state_dict(state_dict)
 
-    
     best_rsum = 0
     start_epoch = 0
-
-    # save the history of losses from two networks
     all_loss = [[], []]
 
-    # Warmup
-    logger.info("\n* Warmup")
-    if opt.warmup_model_path:
-        if os.path.isfile(opt.warmup_model_path):
-            checkpoint = torch.load(
-                opt.warmup_model_path, map_location="cpu", weights_only=False
+    if opt.resume:
+        if not os.path.isfile(opt.resume):
+            raise FileNotFoundError("resume checkpoint not found: {}".format(opt.resume))
+        checkpoint = torch.load(opt.resume, map_location="cpu", weights_only=False)
+        if checkpoint.get("schema") != "tugr_checkpoint_v1":
+            raise ValueError(
+                "--resume requires a strict TUGR checkpoint with runtime state"
             )
-            model_A.load_state_dict(checkpoint["model_A"])
-            model_B.load_state_dict(checkpoint["model_B"])
-            logger.info(
-                "=> load warmup checkpoint '{}' (epoch {})".format(
-                    opt.warmup_model_path, checkpoint["epoch"]
-                )
-            )
-            logger.info("\nValidattion ...")
-            validate(opt, val_loader, [model_A, model_B])
-        else:
-            raise Exception(
-                "=> no checkpoint found at '{}'".format(opt.warmup_model_path)
-            )
+        _validate_resume_config(opt, checkpoint["opt"])
+        model_A.load_state_dict(checkpoint["model_A"])
+        model_B.load_state_dict(checkpoint["model_B"])
+        ensure_rectification_modules(opt, model_A)
+        ensure_rectification_modules(opt, model_B)
+        load_rectification_state_dict(model_A, checkpoint["rectification_A"])
+        load_rectification_state_dict(model_B, checkpoint["rectification_B"])
+        model_A.optimizer.load_state_dict(checkpoint["optimizer_A"])
+        model_B.optimizer.load_state_dict(checkpoint["optimizer_B"])
+        best_rsum = float(checkpoint["best_rsum"])
+        start_epoch = int(checkpoint["next_epoch"])
+        all_loss = checkpoint["all_loss"]
+        restore_rng_state(checkpoint["rng_state"])
+        logger.info(
+            "=> strictly resumed '{}' at co-training epoch {} (best rSum {:.4f})",
+            opt.resume,
+            start_epoch,
+            best_rsum,
+        )
     else:
-        epoch = 0
-        for epoch in range(0, opt.warmup_epoch):
-            logger.info("[{}/{}] Warmup model_A".format(epoch + 1, opt.warmup_epoch))
-            warmup(opt, noisy_trainloader, model_A, epoch)
-            logger.info("[{}/{}] Warmup model_B".format(epoch + 1, opt.warmup_epoch))
-            warmup(opt, noisy_trainloader, model_B, epoch)
+        logger.info("\n* Warmup")
+        if opt.warmup_model_path:
+            if os.path.isfile(opt.warmup_model_path):
+                checkpoint = torch.load(
+                    opt.warmup_model_path, map_location="cpu", weights_only=False
+                )
+                model_A.load_state_dict(checkpoint["model_A"])
+                model_B.load_state_dict(checkpoint["model_B"])
+                logger.info(
+                    "=> load warmup checkpoint '{}' (epoch {})".format(
+                        opt.warmup_model_path, checkpoint["epoch"]
+                    )
+                )
+                logger.info("\nValidation ...")
+                validate(opt, val_loader, [model_A, model_B])
+            else:
+                raise FileNotFoundError(
+                    "warmup checkpoint not found: {}".format(opt.warmup_model_path)
+                )
+        else:
+            for epoch in range(0, opt.warmup_epoch):
+                logger.info(
+                    "[{}/{}] Warmup model_A".format(epoch + 1, opt.warmup_epoch)
+                )
+                warmup(opt, noisy_trainloader, model_A, epoch)
+                logger.info(
+                    "[{}/{}] Warmup model_B".format(epoch + 1, opt.warmup_epoch)
+                )
+                warmup(opt, noisy_trainloader, model_B, epoch)
 
-            save_checkpoint(
-                {
-                    "epoch": epoch,
-                    "model_A": model_A.state_dict(),
-                    "model_B": model_B.state_dict(),
-                    "opt": opt,
-                },
-                is_best=False,
-                filename="warmup_model_{}.pth.tar".format(epoch),
-                prefix=opt.output_dir + "/",
+                save_checkpoint(
+                    {
+                        "epoch": epoch,
+                        "model_A": model_A.state_dict(),
+                        "model_B": model_B.state_dict(),
+                        "opt": opt,
+                    },
+                    is_best=False,
+                    filename="warmup_model_{}.pth.tar".format(epoch),
+                    prefix=opt.output_dir + "/",
+                )
+                logger.info("\nValidation ...")
+                validate(opt, val_loader, [model_A, model_B])
+
+        ensure_rectification_modules(opt, model_A)
+        ensure_rectification_modules(opt, model_B)
+
+    training_end_epoch = opt.co_train_epochs or opt.num_epochs
+    if start_epoch >= training_end_epoch:
+        raise ValueError(
+            "resume next_epoch {} is not below training end epoch {}".format(
+                start_epoch, training_end_epoch
             )
-
-        # evaluate on validation set
-            logger.info("\nValidattion ...")
-            validate(opt, val_loader, [model_A, model_B])
-
-    # save the history of losses from two networks
-    all_loss = [[], []]
+        )
     logger.info("\n* Co-training")
 
     # Train the Model
-    for epoch in range(start_epoch, opt.num_epochs):
+    for epoch in range(start_epoch, training_end_epoch):
         logger.info("\nEpoch [{}/{}]".format(epoch, opt.num_epochs))
         adjust_learning_rate(opt, model_A.optimizer, epoch)
         adjust_learning_rate(opt, model_B.optimizer, epoch)
@@ -306,16 +712,55 @@ def main(opt):
         # remember best R@ sum and save checkpoint
         is_best = rsum > best_rsum
         best_rsum = max(rsum, best_rsum)
+        evaluation_checkpoint = {
+            "schema": "tugr_eval_checkpoint_v1",
+            "epoch": epoch,
+            "model_A": model_A.state_dict(),
+            "model_B": model_B.state_dict(),
+            "i2t_refiner_A": model_A.i2t_refiner_node.state_dict(),
+            "t2i_refiner_A": model_A.t2i_refiner_node.state_dict(),
+            "i2t_refiner_B": model_B.i2t_refiner_node.state_dict(),
+            "t2i_refiner_B": model_B.t2i_refiner_node.state_dict(),
+            "best_rsum": best_rsum,
+            "opt": opt,
+        }
         save_checkpoint(
-            {
-                "epoch": epoch,
-                "model_A": model_A.state_dict(),
-                "model_B": model_B.state_dict(),
-                "best_rsum": best_rsum,
-                "opt": opt,
-            },
+            evaluation_checkpoint,
             is_best,
             filename="checkpoint_{}.pth.tar".format(epoch),
+            prefix=opt.output_dir + "/",
+        )
+
+        # Runtime Memory and Adam moments are large.  Keep one strict, complete
+        # epoch-boundary snapshot instead of duplicating them in every numbered
+        # evaluation checkpoint.
+        resume_checkpoint = {
+            key: value
+            for key, value in evaluation_checkpoint.items()
+            if key
+            not in {
+                "i2t_refiner_A",
+                "t2i_refiner_A",
+                "i2t_refiner_B",
+                "t2i_refiner_B",
+            }
+        }
+        resume_checkpoint.update(
+            {
+                "schema": "tugr_checkpoint_v1",
+                "next_epoch": epoch + 1,
+                "rectification_A": rectification_state_dict(model_A),
+                "rectification_B": rectification_state_dict(model_B),
+                "optimizer_A": model_A.optimizer.state_dict(),
+                "optimizer_B": model_B.optimizer.state_dict(),
+                "all_loss": all_loss,
+                "rng_state": capture_rng_state(),
+            }
+        )
+        save_checkpoint(
+            resume_checkpoint,
+            is_best=False,
+            filename="resume_latest.pth.tar",
             prefix=opt.output_dir + "/",
         )
 
@@ -326,6 +771,8 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
     """
     losses_l = AverageMeter("Loss L", ":.4e")  
     losses_u = AverageMeter("Loss U", ":.4e")
+    losses_u_i2t = AverageMeter("Loss U-i2t", ":.4e")
+    losses_u_t2i = AverageMeter("Loss U-t2i", ":.4e")
     batch_time = AverageMeter("batch", ":6.3f")
     data_time = AverageMeter("data", ":6.3f")
     
@@ -334,45 +781,25 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
     progress = ProgressMeter(
         # len(labeled_trainloader),
         max_len, 
-        [batch_time, data_time, losses_l, losses_u],
+        [
+            batch_time,
+            data_time,
+            losses_l,
+            losses_u,
+            losses_u_i2t,
+            losses_u_t2i,
+        ],
         prefix=f"Epoch[{epoch}/{opt.num_epochs}] Training Step",
     )
 
-    if not hasattr(net, 'memory_queue'):
-        net.memory_queue = build_memory_queue(opt)
-    
-    if not hasattr(net, 'i2t_refiner_node'):
-        net.i2t_refiner_node = GraphRefiner(dim=opt.embed_size, k=opt.k).cuda()
-        net.i2t_refiner_node.train()
-        net.optimizer.add_param_group({
-            "params": net.i2t_refiner_node.parameters(),
-            "lr": opt.learning_rate   # 或者一个更小的 lr
-        })
-    if not hasattr(net, 't2i_refiner_node'):
-        net.t2i_refiner_node = GraphRefiner(dim=opt.embed_size, k=opt.k).cuda()
-        net.t2i_refiner_node.train()
-        net.optimizer.add_param_group({
-            "params": net.t2i_refiner_node.parameters(),
-            "lr": opt.learning_rate   # 或者一个更小的 lr
-        })
-
-    if not hasattr(net2, 'memory_queue'):
-        net2.memory_queue = build_memory_queue(opt)
-        
-    if not hasattr(net2, 'i2t_refiner_node'):
-        net2.i2t_refiner_node = GraphRefiner(dim=opt.embed_size, k=opt.k).cuda()
-        net2.i2t_refiner_node.train()
-        net2.optimizer.add_param_group({
-            "params": net2.i2t_refiner_node.parameters(),
-            "lr": opt.learning_rate    # 或者一个更小的 lr
-        })
-    if not hasattr(net2, 't2i_refiner_node'):  
-        net2.t2i_refiner_node = GraphRefiner(dim=opt.embed_size, k=opt.k).cuda()
-        net2.t2i_refiner_node.train()
-        net2.optimizer.add_param_group({
-            "params": net2.t2i_refiner_node.parameters(),
-            "lr": opt.learning_rate    # 或者一个更小的 lr
-        })
+    ensure_rectification_modules(opt, net)
+    ensure_rectification_modules(opt, net2)
+    net.i2t_refiner_node.train()
+    net.t2i_refiner_node.train()
+    net.i2t_refiner_node.reset_diagnostics()
+    net.t2i_refiner_node.reset_diagnostics()
+    net2.i2t_refiner_node.eval()
+    net2.t2i_refiner_node.eval()
     criterion = net.criterion
     
     # fix one network and train the other
@@ -398,7 +825,7 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
                 batch_prob_l,
                 batch_clean_labels_l,
             ) = next(labeled_train_iter)
-        except:
+        except StopIteration:
             labeled_train_iter = iter(labeled_trainloader)
             (
                 batch_images_l,
@@ -425,7 +852,7 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
             # ) = unlabeled_train_iter.next()
             ) = next(unlabeled_train_iter)
 
-        except:
+        except StopIteration:
             unlabeled_train_iter = iter(unlabeled_trainloader)
             (
                 batch_images_u,
@@ -484,6 +911,9 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
 
         img_emb_u, cap_emb_u, cap_len_u = net.forward_emb(batch_images_u, batch_text_u, batch_lengths_u, imgae_lengths=batch_img_len_u)
 
+        loss_u_i2t = torch.zeros((), device=img_emb_u.device)
+        loss_u_t2i = torch.zeros((), device=img_emb_u.device)
+
         if opt.i2t:
 
             corrected_txt_emb = net2.memory_queue.retrieve_nearest_text(
@@ -496,21 +926,19 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
             )
             # corrected_txt_emb = net2.memory_queue.retrieve_nearest_text(img_emb_u, k=opt.k, refiner_node=None)
 
-            loss_u = torch.tensor(0.0).cuda()
             if corrected_txt_emb is not None:
                 sims_u = img_emb_u.mm(corrected_txt_emb.t())
-                loss_u = infonce(sims_u)
+                loss_u_i2t = infonce(sims_u)
 
                 correction_weight = 0.5
-                loss_u = loss_u * correction_weight
-                if torch.isfinite(loss_u).item():
-                    loss_u.backward()
+                loss_u_i2t = loss_u_i2t * correction_weight
+                if torch.isfinite(loss_u_i2t).item():
+                    loss_u_i2t.backward()
                 else:
                     logger.warning(
-                        f"Step {i}: i2t unlabeled loss is not finite ({loss_u.item()}); skip its backward"
+                        f"Step {i}: i2t unlabeled loss is not finite ({loss_u_i2t.item()}); skip its backward"
                     )
-            else:
-                pass
+                    loss_u_i2t = torch.zeros((), device=img_emb_u.device)
             
         if opt.t2i:
             corrected_img_emb = net2.memory_queue.retrieve_nearest_img(
@@ -523,21 +951,21 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
             )
             # corrected_img_emb = net2.memory_queue.retrieve_nearest_img(cap_emb_u, k=opt.k, refiner_node=None)
 
-            loss_u = torch.tensor(0.0).cuda()
             if corrected_img_emb is not None:
                 sims_u = cap_emb_u.mm(corrected_img_emb.t())
-                loss_u = infonce(sims_u)
+                loss_u_t2i = infonce(sims_u)
 
                 correction_weight = 0.5
-                loss_u = loss_u * correction_weight
-                if torch.isfinite(loss_u).item():
-                    loss_u.backward()
+                loss_u_t2i = loss_u_t2i * correction_weight
+                if torch.isfinite(loss_u_t2i).item():
+                    loss_u_t2i.backward()
                 else:
                     logger.warning(
-                        f"Step {i}: t2i unlabeled loss is not finite ({loss_u.item()}); skip its backward"
+                        f"Step {i}: t2i unlabeled loss is not finite ({loss_u_t2i.item()}); skip its backward"
                     )
-            else:
-                pass
+                    loss_u_t2i = torch.zeros((), device=img_emb_u.device)
+
+        loss_u = loss_u_i2t.detach() + loss_u_t2i.detach()
 
         # 梯度有限性检查 + 梯度裁剪和更新
         # 注意：GraphRefiner 参数是通过 add_param_group 动态加入 optimizer 的，
@@ -550,7 +978,9 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
         )
         if grads_finite:
             if net.grad_clip > 0:
-                clip_grad_norm_(net.params, net.grad_clip)
+                clip_grad_norm_(
+                    _optimizer_parameters(net.optimizer), net.grad_clip
+                )
             net.optimizer.step()
         else:
             logger.warning(f"Step {i}: non-finite gradients detected; skipping optimizer step")
@@ -559,9 +989,9 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
         # loss = loss_l + loss_u
         losses_l.update(loss_l.item(), batch_images_l.size(0))
 
-        # 只有在进行了噪声矫正训练时才更新 losses_u
-        if 'loss_u' in locals(): 
-            losses_u.update(loss_u.item(), batch_images_u.size(0))
+        losses_u.update(loss_u.item(), batch_images_u.size(0))
+        losses_u_i2t.update(loss_u_i2t.detach().item(), batch_images_u.size(0))
+        losses_u_t2i.update(loss_u_t2i.detach().item(), batch_images_u.size(0))
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -573,6 +1003,14 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
 
     logger.info("Writer memory diagnostics: %s", net.memory_queue.diagnostics())
     logger.info("Peer memory diagnostics: %s", net2.memory_queue.diagnostics())
+    logger.info(
+        "Writer i2t GraphRefiner diagnostics: %s",
+        net.i2t_refiner_node.diagnostics(),
+    )
+    logger.info(
+        "Writer t2i GraphRefiner diagnostics: %s",
+        net.t2i_refiner_node.diagnostics(),
+    )
 
 
 def warmup(opt, train_loader, model, epoch):

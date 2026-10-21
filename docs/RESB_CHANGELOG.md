@@ -1,4 +1,9 @@
-# RESB v1 controlled change record
+# RESB v1 parent controlled change record
+
+> Historical inheritance note: this file describes the RESB-v1 parent before
+> TUGR was added. Statements below that GraphRefiner was unchanged apply only
+> to that parent ablation. See `TUGR_CHANGELOG.md` for the changes in this
+> directory.
 
 ## Parent
 

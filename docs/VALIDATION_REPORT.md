@@ -1,42 +1,71 @@
 # Local validation report
 
-Date: 2026-10-20
+Date: 2026-10-21
 
-## Passed
+Target: A5-Delete + RESB M2 + TUGR-Full
 
-1. Every Python file compiled with `python -m compileall`.
-2. Eight deterministic CPU unit tests passed:
-   - stable record IDs after labeled-subset reconstruction;
-   - FIFO wrap and original top-K retrieval behaviour;
-   - single-slot ID refresh and metadata update;
-   - exact self-record exclusion;
-   - reliability reranking;
-   - MMR value diversity;
-   - Memory state round-trip;
-   - gradient flow from selected supports into a differentiable refiner.
-3. The `GraphRefiner` source block is byte-for-byte identical to the parent
-   A5-Delete block.
-4. All files declared unchanged in `RESB_CHANGELOG.md` match their parent
-   SHA-256 hashes.
-5. Every entry in `code_checksums.sha256` matched the delivered file.
+## Passed locally
+
+1. Every Python source compiled successfully with `python -m compileall -q .`.
+2. Sixteen deterministic CPU tests passed:
+   - eight inherited RESB/data tests;
+   - exact propagation of query embeddings from Memory to GraphRefiner;
+   - legacy mean-path numerical equivalence;
+   - analytical two-query DUA value;
+   - finite batch-size-one utility fallback;
+   - shape, finiteness, and unit-norm checks for all four factorial modes;
+   - finite TUGR backward gradients and frozen unused legacy edges;
+   - query-alignment input validation;
+   - compact Memory plus directional GraphRefiner state round-trip.
+   - atomic checkpoint completion and temporary-file cleanup.
+3. The test command completed with no failures:
+
+   ```text
+   python -m unittest -v test_memory_bank.py test_tugr.py
+   Ran 16 tests ... OK
+   ```
+
+4. The new `mean` mode was evaluated against an explicit implementation of
+   the parent A5-Delete forward equations after copying the same weights; the
+   outputs matched within `atol=1e-7, rtol=1e-6`.
+5. DUA was checked against a closed-form two-query example with expected
+   utilities `[[1, -1], [1, -1]]`.
+6. Compact Memory serialization restores the ID-to-slot mapping and selected
+   output; the complete rectification state restores both directional
+   GraphRefiner tensors exactly.
+
+## Engineering protections added
+
+- full-optimizer gradient finiteness checks and clipping;
+- separate i2t and t2i unlabeled-loss accounting;
+- atomic checkpoint replacement;
+- one non-duplicated strict-resume checkpoint;
+- complete Memory/optimizer/RNG epoch-boundary state;
+- critical-configuration compatibility checks on resume;
+- numerical and shape validation at the GraphRefiner boundary.
 
 ## Environment-limited check
 
-Importing the complete training entry point on this Windows host fails inside
-the unchanged `vse.py` import of `torchtext`, with `OSError: [WinError 127]`.
-The installed `torchtext` binary is incompatible with the installed PyTorch
-runtime.  `vse.py` itself is byte-identical to the A5-Delete parent, so this is
-an environment dependency failure rather than a RESB regression.
+Importing the unmodified `vse.py` on this Windows host fails in `torchtext`
+with `OSError: [WinError 127]`. The installed torchtext binary is incompatible
+with the installed PyTorch runtime. GraphRefiner tests isolate that unrelated
+import; the full CUDA VSE training path cannot be executed on this machine.
+The local WSL launcher also returns `E_ACCESSDENIED`, so the supplied Bash
+launcher must receive its final `bash -n` check in AutoDL.
 
-No claim is made that a complete GPU training epoch was run locally.
+No claim is made that a complete GPU epoch or a retrieval improvement has been
+observed locally.
 
-## Required AutoDL smoke test before a full experiment
+## Required AutoDL checks before the fixed-20 reproduction
 
 In the known working IN2R environment:
 
-1. run `python -m unittest -v test_memory_bank.py`;
-2. launch `run.py` with the established A5-Delete paths/noise map, one short
-   controlled job per Memory mode;
-3. confirm that both model phases reach validation and that Memory diagnostics
-   are finite;
-4. only then launch the full seed-42 ablation.
+1. run `python -m unittest -v test_memory_bank.py test_tugr.py`;
+2. compile with `python -m compileall -q .`;
+3. run one short TUGR-Full smoke job that reaches both co-training phases and
+   validation;
+4. verify finite `utility_*`, `pool_*`, `effective_k`, and `message_entropy`;
+5. interrupt after an epoch and resume once from `resume_latest.pth.tar`;
+6. then launch the fixed seed-42 run with `num_epochs=40` as the cosine
+   horizon and `co_train_epochs=20` as the actual execution budget, without
+   changing the default detached-utility setting.

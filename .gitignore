@@ -28,6 +28,7 @@ vector_cache/
 nltk_data/
 glove*/
 punkt.zip
+*.npy
 
 # Training outputs and models
 output/

@@ -20,7 +20,8 @@ class TinyRefiner(nn.Module):
         super().__init__()
         self.projection = nn.Linear(dim, dim)
 
-    def forward(self, neighbors):
+    def forward(self, neighbors, query_feats=None):
+        self.last_query_feats = query_feats
         return F.normalize(self.projection(neighbors).mean(dim=1), dim=-1)
 
 
@@ -179,7 +180,10 @@ class MemoryBankTests(unittest.TestCase):
             current_epoch=1,
         )
         restored = MemoryQueue(**kwargs)
-        restored.load_state_dict(source.state_dict())
+        state = source.state_dict()
+        self.assertEqual(state["schema"], 2)
+        self.assertEqual(tuple(state["img_queue"].shape), (2, 2))
+        restored.load_state_dict(state)
 
         self.assertEqual(restored._id_to_slot, source._id_to_slot)
         query = unit_rows([1, 0])
@@ -208,14 +212,16 @@ class MemoryBankTests(unittest.TestCase):
             current_epoch=0,
         )
         refiner = TinyRefiner(dim=4)
+        query = features[:2]
         output = bank.retrieve_nearest_text(
-            features[:2],
+            query,
             k=2,
             refiner_node=refiner,
             query_ids=[99, 100],
             current_epoch=1,
         )
         output.sum().backward()
+        self.assertIs(refiner.last_query_feats, query)
         self.assertIsNotNone(refiner.projection.weight.grad)
         self.assertTrue(torch.isfinite(refiner.projection.weight.grad).all())
 
