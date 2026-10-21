@@ -171,7 +171,7 @@ python -m pip install -r requirements.txt
 
 ```bash
 cd /root/autodl-fs
-git clone https://github.com/xiangzifan/IN2R.git IN2R_repo
+git clone https://github.com/xiangzifan/xzf.git IN2R_repo
 cd IN2R_repo
 git fetch origin --tags
 git switch main
