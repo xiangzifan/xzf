@@ -18,6 +18,7 @@ sys.modules.setdefault("vse", vse_stub)
 
 from co_train import (
     GraphRefiner,
+    _lookup_peer_clean_probability,
     ensure_rectification_modules,
     load_rectification_state_dict,
     rectification_state_dict,
@@ -35,6 +36,25 @@ class DummyNet:
 class GraphRefinerTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(7)
+
+    def test_peer_clean_probability_is_gathered_by_stable_record_id(self):
+        probabilities = [0.1, 0.2, 0.3, 0.4]
+        gathered = _lookup_peer_clean_probability(
+            probabilities,
+            batch_ids=(3, 0, 2),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        self.assertTrue(
+            torch.allclose(gathered, torch.tensor([0.4, 0.1, 0.3]))
+        )
+        with self.assertRaises(IndexError):
+            _lookup_peer_clean_probability(
+                probabilities,
+                batch_ids=(4,),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
 
     def test_mean_mode_is_equivalent_to_legacy_forward(self):
         refiner = GraphRefiner(

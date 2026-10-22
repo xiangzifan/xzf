@@ -55,9 +55,11 @@ sha256sum "$NOISE_FILE" > "$OUTPUT_DIR/noise_sha256.txt"
   fi
 } > "$OUTPUT_DIR/environment.txt"
 "$PYTHON_BIN" -m py_compile co_train.py memory_bank.py run.py \
-  tests/test_memory_bank.py tests/test_tugr.py \
+  selective_rectification.py tests/test_memory_bank.py tests/test_tugr.py \
+  tests/test_cusr.py \
   2>&1 | tee "$OUTPUT_DIR/compile.log"
 "$PYTHON_BIN" -m unittest -v tests/test_memory_bank.py tests/test_tugr.py \
+  tests/test_cusr.py \
   2>&1 | tee "$OUTPUT_DIR/unit_tests.log"
 
 cmd=(
@@ -73,6 +75,7 @@ cmd=(
   --memory_mmr_balance=0.80 --memory_alpha_min=0.20 --memory_alpha_max=0.80
   --memory_quality_momentum=0.50 --memory_mode=quality_diverse
   --refiner_mode=mean --refiner_heads=4 --refiner_dropout=0.1
+  --rectification_policy=fixed_all --correction_weight=0.5
   --refiner_qasr_pool_temperature=0.25
   --refiner_qasr_query_weight=1.0 --refiner_qasr_consensus_weight=0.5
   --refiner_qasr_metadata_weight=0.25 --refiner_qasr_graph_strength=0.5

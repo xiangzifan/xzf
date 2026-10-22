@@ -18,6 +18,11 @@ from vse import VSE, infonce
 from vocab import Vocabulary, deserialize_vocab
 from evaluation import i2t, t2i, encode_data, shard_attn_scores
 from memory_bank import MemoryQueue
+from selective_rectification import (
+    CUSRDiagnostics,
+    build_cusr_evidence,
+    selective_infonce_loss,
+)
 import logging
 from torch.nn.utils.clip_grad import clip_grad_norm_
 
@@ -637,6 +642,29 @@ def _optimizer_parameters(optimizer):
     return parameters
 
 
+def _lookup_peer_clean_probability(
+    peer_clean_probability, batch_ids, device, dtype
+):
+    """Gather the peer model's GMM clean probability by stable record ID."""
+    if peer_clean_probability is None:
+        raise ValueError("peer_clean_probability is required by CUSR")
+    probabilities = np.asarray(peer_clean_probability)
+    if probabilities.ndim != 1 or probabilities.size < 1:
+        raise ValueError("peer_clean_probability must be a nonempty vector")
+    if not np.isfinite(probabilities).all():
+        raise ValueError("peer_clean_probability must be finite")
+    if np.any(probabilities < 0) or np.any(probabilities > 1):
+        raise ValueError("peer_clean_probability must be in [0, 1]")
+    record_ids = np.asarray(batch_ids, dtype=np.int64).reshape(-1)
+    if record_ids.size < 1:
+        raise ValueError("batch_ids must be nonempty")
+    if np.any(record_ids < 0) or np.any(record_ids >= probabilities.size):
+        raise IndexError("batch_ids fall outside peer_clean_probability")
+    return torch.as_tensor(
+        probabilities[record_ids], dtype=dtype, device=device
+    )
+
+
 def ensure_rectification_modules(opt, net):
     """Create Memory and both refiners exactly once and register optimizer groups."""
     device = _model_device(net)
@@ -709,6 +737,12 @@ def _validate_resume_config(opt, saved_opt):
         "lr_scheduler",
         "lambda_intra",
         "margin",
+        "rectification_policy",
+        "correction_weight",
+        "cusr_utility_temperature",
+        "cusr_gate_temperature",
+        "cusr_min_gain",
+        "cusr_min_utility",
         "embed_size",
         "k",
         "queue_size",
@@ -844,7 +878,7 @@ def main(opt):
         all_loss = checkpoint["all_loss"]
         restore_rng_state(checkpoint["rng_state"])
         logger.info(
-            "=> strictly resumed '{}' at co-training epoch {} (best rSum {:.4f})",
+            "=> strictly resumed '%s' at co-training epoch %d (best rSum %.4f)",
             opt.resume,
             start_epoch,
             best_rsum,
@@ -972,7 +1006,15 @@ def main(opt):
             pred=pred_B,
             prob=prob_B,
         )
-        train(opt, model_A, model_B, labeled_trainloader, unlabeled_trainloader, epoch)
+        train(
+            opt,
+            model_A,
+            model_B,
+            labeled_trainloader,
+            unlabeled_trainloader,
+            epoch,
+            peer_clean_probability=prob_B,
+        )
 
         logger.info("\nModel B training ...")
         # train model_B
@@ -988,7 +1030,15 @@ def main(opt):
             pred=pred_A,
             prob=prob_A,
         )
-        train(opt, model_B, model_A, labeled_trainloader, unlabeled_trainloader, epoch)
+        train(
+            opt,
+            model_B,
+            model_A,
+            labeled_trainloader,
+            unlabeled_trainloader,
+            epoch,
+            peer_clean_probability=prob_A,
+        )
 
         logger.info("\nValidattion ...")
         # evaluate on validation set
@@ -1050,7 +1100,15 @@ def main(opt):
         )
 
 
-def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch=None):
+def train(
+    opt,
+    net,
+    net2,
+    labeled_trainloader,
+    unlabeled_trainloader=None,
+    epoch=None,
+    peer_clean_probability=None,
+):
     """
     One epoch training.
     """
@@ -1058,6 +1116,11 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
     losses_u = AverageMeter("Loss U", ":.4e")
     losses_u_i2t = AverageMeter("Loss U-i2t", ":.4e")
     losses_u_t2i = AverageMeter("Loss U-t2i", ":.4e")
+    use_cusr = opt.rectification_policy == "cusr"
+    cusr_i2t_diagnostics = CUSRDiagnostics()
+    cusr_t2i_diagnostics = CUSRDiagnostics()
+    if use_cusr and peer_clean_probability is None:
+        raise ValueError("peer_clean_probability is required by CUSR")
     batch_time = AverageMeter("batch", ":6.3f")
     data_time = AverageMeter("data", ":6.3f")
     
@@ -1198,6 +1261,14 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
 
         loss_u_i2t = torch.zeros((), device=img_emb_u.device)
         loss_u_t2i = torch.zeros((), device=img_emb_u.device)
+        batch_peer_clean_probability = None
+        if use_cusr:
+            batch_peer_clean_probability = _lookup_peer_clean_probability(
+                peer_clean_probability,
+                batch_ids_u,
+                device=img_emb_u.device,
+                dtype=img_emb_u.dtype,
+            )
 
         if opt.i2t:
 
@@ -1213,13 +1284,36 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
 
             if corrected_txt_emb is not None:
                 sims_u = img_emb_u.mm(corrected_txt_emb.t())
-                loss_u_i2t = infonce(sims_u)
-
-                correction_weight = 0.5
-                loss_u_i2t = loss_u_i2t * correction_weight
-                if torch.isfinite(loss_u_i2t).item():
-                    loss_u_i2t.backward()
+                selected_weight_sum = None
+                if use_cusr:
+                    observed_sims = img_emb_u.mm(cap_emb_u.t())
+                    evidence = build_cusr_evidence(
+                        observed_sims,
+                        sims_u,
+                        batch_peer_clean_probability,
+                        utility_temperature=opt.cusr_utility_temperature,
+                        gate_temperature=opt.cusr_gate_temperature,
+                        min_gain=opt.cusr_min_gain,
+                        min_utility=opt.cusr_min_utility,
+                    )
+                    cusr_i2t_diagnostics.update(
+                        evidence, clean_labels=batch_clean_labels_u
+                    )
+                    loss_u_i2t, _, selected_weight_sum = selective_infonce_loss(
+                        sims_u,
+                        evidence["weights"],
+                        scale=opt.correction_weight,
+                    )
                 else:
+                    loss_u_i2t = infonce(sims_u) * opt.correction_weight
+
+                has_selected = (
+                    selected_weight_sum is None
+                    or float(selected_weight_sum.item()) > 0.0
+                )
+                if torch.isfinite(loss_u_i2t).item() and has_selected:
+                    loss_u_i2t.backward()
+                elif not torch.isfinite(loss_u_i2t).item():
                     logger.warning(
                         f"Step {i}: i2t unlabeled loss is not finite ({loss_u_i2t.item()}); skip its backward"
                     )
@@ -1238,13 +1332,36 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
 
             if corrected_img_emb is not None:
                 sims_u = cap_emb_u.mm(corrected_img_emb.t())
-                loss_u_t2i = infonce(sims_u)
-
-                correction_weight = 0.5
-                loss_u_t2i = loss_u_t2i * correction_weight
-                if torch.isfinite(loss_u_t2i).item():
-                    loss_u_t2i.backward()
+                selected_weight_sum = None
+                if use_cusr:
+                    observed_sims = cap_emb_u.mm(img_emb_u.t())
+                    evidence = build_cusr_evidence(
+                        observed_sims,
+                        sims_u,
+                        batch_peer_clean_probability,
+                        utility_temperature=opt.cusr_utility_temperature,
+                        gate_temperature=opt.cusr_gate_temperature,
+                        min_gain=opt.cusr_min_gain,
+                        min_utility=opt.cusr_min_utility,
+                    )
+                    cusr_t2i_diagnostics.update(
+                        evidence, clean_labels=batch_clean_labels_u
+                    )
+                    loss_u_t2i, _, selected_weight_sum = selective_infonce_loss(
+                        sims_u,
+                        evidence["weights"],
+                        scale=opt.correction_weight,
+                    )
                 else:
+                    loss_u_t2i = infonce(sims_u) * opt.correction_weight
+
+                has_selected = (
+                    selected_weight_sum is None
+                    or float(selected_weight_sum.item()) > 0.0
+                )
+                if torch.isfinite(loss_u_t2i).item() and has_selected:
+                    loss_u_t2i.backward()
+                elif not torch.isfinite(loss_u_t2i).item():
                     logger.warning(
                         f"Step {i}: t2i unlabeled loss is not finite ({loss_u_t2i.item()}); skip its backward"
                     )
@@ -1296,6 +1413,15 @@ def train(opt, net, net2, labeled_trainloader, unlabeled_trainloader=None, epoch
         "Writer t2i GraphRefiner diagnostics: %s",
         net.t2i_refiner_node.diagnostics(),
     )
+    if use_cusr:
+        logger.info(
+            "Writer i2t CUSR diagnostics: %s",
+            cusr_i2t_diagnostics.as_dict(),
+        )
+        logger.info(
+            "Writer t2i CUSR diagnostics: %s",
+            cusr_t2i_diagnostics.as_dict(),
+        )
 
 
 def warmup(opt, train_loader, model, epoch):

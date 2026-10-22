@@ -145,6 +145,46 @@ def run():
         "--p_threshold", default=0.5, type=float, help="clean probability threshold"
     )
     parser.add_argument(
+        "--rectification_policy",
+        default="fixed_all",
+        choices=["fixed_all", "cusr"],
+        help=(
+            "Unlabeled-pair policy: fixed_all preserves IN2R's fixed 0.5 "
+            "correction, while cusr applies counterfactual utility-guided "
+            "selective rectification."
+        ),
+    )
+    parser.add_argument(
+        "--correction_weight",
+        default=0.5,
+        type=float,
+        help="Global multiplier for the unlabeled rectification loss.",
+    )
+    parser.add_argument(
+        "--cusr_utility_temperature",
+        default=0.05,
+        type=float,
+        help="Temperature of CUSR's bidirectional negative LogMeanExp utility.",
+    )
+    parser.add_argument(
+        "--cusr_gate_temperature",
+        default=0.05,
+        type=float,
+        help="Temperature mapping positive counterfactual gain to CUSR weight.",
+    )
+    parser.add_argument(
+        "--cusr_min_gain",
+        default=0.0,
+        type=float,
+        help="Strict minimum prototype-over-observed utility gain for CUSR.",
+    )
+    parser.add_argument(
+        "--cusr_min_utility",
+        default=0.0,
+        type=float,
+        help="Strict minimum absolute prototype utility for CUSR.",
+    )
+    parser.add_argument(
         "--soft_margin", default="exponential", help="linear|exponential|sin"
     )
 
@@ -347,6 +387,19 @@ def run():
         parser.error("--co_train_epochs must be 0 or in [1, num_epochs]")
     if opt.resume and opt.warmup_model_path:
         parser.error("--resume and --warmup_model_path are mutually exclusive")
+    cusr_scalars = (
+        opt.correction_weight,
+        opt.cusr_utility_temperature,
+        opt.cusr_gate_temperature,
+        opt.cusr_min_gain,
+        opt.cusr_min_utility,
+    )
+    if any(not np.isfinite(value) for value in cusr_scalars):
+        parser.error("rectification and CUSR scalars must be finite")
+    if opt.correction_weight < 0:
+        parser.error("--correction_weight must be nonnegative")
+    if opt.cusr_utility_temperature <= 0 or opt.cusr_gate_temperature <= 0:
+        parser.error("CUSR temperatures must be positive")
     if opt.refiner_heads < 1:
         parser.error("--refiner_heads must be positive")
     if opt.embed_size % opt.refiner_heads != 0:
@@ -394,6 +447,10 @@ def run():
         parser.error("--refiner_qasr_residual_strength must be in [0, 1]")
     if opt.refiner_mode == "qasr_full" and opt.memory_mode != "quality_diverse":
         parser.error("--refiner_mode=qasr_full requires --memory_mode=quality_diverse")
+    if opt.rectification_policy == "cusr" and opt.refiner_mode != "mean":
+        parser.error("--rectification_policy=cusr requires --refiner_mode=mean")
+    if opt.rectification_policy == "cusr" and opt.memory_mode != "quality_diverse":
+        parser.error("--rectification_policy=cusr requires --memory_mode=quality_diverse")
     if opt.memory_candidate_pool_size < opt.k:
         parser.error("--memory_candidate_pool_size must be >= --k")
     if (
